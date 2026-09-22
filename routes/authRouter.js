@@ -77,21 +77,21 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
             userAgent: req.headers["user-agent"]
         });
 
-        /* res.cookie("idToken", idToken, {
+        res.cookie("idToken", idToken, {
             httpOnly: true,
             sameSite: "lax",
             secure: true,
-            domain: ".boggeropropiedades.com.ar",
+            domain: ".quintadeargos.com",
             maxAge: 60 * 60 * 1000,
             path: "/"
-        }); */
+        });
 
-        res.cookie("idToken", idToken, {
+        /* res.cookie("idToken", idToken, {
             httpOnly: true,
             sameSite: "none",
             secure: true,
             path: "/" 
-        });
+        }); */
 
         // Enviamos los datos necesarios para el setUser del front
         return res.status(200).json({ 
@@ -131,20 +131,20 @@ authRouter.post("/logout", async (req, res) => {
             })
         }
         // Limpio Cookie
-        /* res.clearCookie("idToken", {
+        res.clearCookie("idToken", {
             httpOnly: true,
             sameSite: "lax",
             secure: true,
-            domain: ".boggeropropiedades.com.ar",
+            domain: ".quintadeargos.com",
             path: "/" 
-        }); */
+        });
 
-        res.clearCookie("idToken", {
+        /* res.clearCookie("idToken", {
             httpOnly: true,
             sameSite: "none",
             secure: true,
             path: "/" 
-        });
+        }); */
 
         return res.status(200).json({ message: "Logout audited! 🟢" })
     } catch (error) {
