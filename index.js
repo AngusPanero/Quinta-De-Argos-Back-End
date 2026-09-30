@@ -6,9 +6,8 @@ const cookieParser = require("cookie-parser")
 const dbConnection = require("./config/mongoose")
 const authRouter = require("./routes/authRouter")
 const contactRouter = require("./routes/contactRouter")
-const mailRouter = require("./nodemailer/nodemailer")
 const firebaseRouter = require("./routes/firebaseRouter")
-const houseRouter = require("./routes/houseRouter")
+const adminReservasRouter = require("./routes/adminReservasRouter")
 
 const app = express()
 const PORT = process.env.PORT
@@ -29,9 +28,8 @@ app.use(cors({
 
 app.use(authRouter)
 app.use(contactRouter)
-app.use(mailRouter)
 app.use(firebaseRouter)
-app.use(houseRouter)
+app.use(adminReservasRouter)
 
 app.use((req,res) => {
     res.send(`<h1>404 - Not Found</h1>`)
