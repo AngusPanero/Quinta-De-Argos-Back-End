@@ -7,6 +7,7 @@ const dbConnection = require("./config/mongoose")
 const authRouter = require("./routes/authRouter")
 const contactRouter = require("./routes/contactRouter")
 const firebaseRouter = require("./routes/firebaseRouter")
+const adminConfigRouter = require("./routes/adminConfigRouter")
 const adminReservasRouter = require("./routes/adminReservasRouter")
 
 const app = express()
@@ -30,6 +31,7 @@ app.use(authRouter)
 app.use(contactRouter)
 app.use(firebaseRouter)
 app.use(adminReservasRouter)
+app.use(adminConfigRouter)
 
 app.use((req,res) => {
     res.send(`<h1>404 - Not Found</h1>`)
