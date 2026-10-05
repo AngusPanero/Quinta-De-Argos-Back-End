@@ -9,6 +9,7 @@ const contactRouter = require("./routes/contactRouter")
 const firebaseRouter = require("./routes/firebaseRouter")
 const adminConfigRouter = require("./routes/adminConfigRouter")
 const adminReservasRouter = require("./routes/adminReservasRouter")
+const adminChannelsRouter = require("./routes/adminChannelsRouter")
 
 const app = express()
 const PORT = process.env.PORT
@@ -32,6 +33,7 @@ app.use(contactRouter)
 app.use(firebaseRouter)
 app.use(adminReservasRouter)
 app.use(adminConfigRouter)
+app.use(adminChannelsRouter)
 
 app.use((req,res) => {
     res.send(`<h1>404 - Not Found</h1>`)
