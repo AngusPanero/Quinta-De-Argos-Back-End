@@ -2,7 +2,7 @@
 // Es la única fuente de verdad: el servidor valida con esto y el panel
 // dibuja el formulario con lo mismo (etiquetas, límites y opciones).
 //
-// IMPORTANTE: los valores de las opciones (stayThrough, arrival, autoConfirmed…)
+// IMPORTANTE: los valores de las opciones (stayThrough, firstNight, autoConfirmed…)
 // tienen que coincidir con los del esquema de Beds24 en el Swagger.
 
 // ---------- Reglas de la casa (habitación 736171) ----------
@@ -14,7 +14,7 @@ const REGLAS_FIELDS = [
     { key: "restrictionStrategy", label: "Cómo se aplica la estancia mínima", type: "select",
         options: [
             { value: "stayThrough", label: "En cada noche de la estadía" },
-            { value: "arrival", label: "Solo según el día de llegada" },
+            { value: "firstNight", label: "Solo según el día de llegada" },
         ] },
     { key: "blockAfterCheckOutDays", label: "Días de preparación tras cada salida", type: "int", min: 0, max: 7, unit: "días",
         help: "Días que quedan cerrados después de cada salida para limpieza." },

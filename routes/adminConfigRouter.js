@@ -7,11 +7,14 @@ const express = require("express");
 const adminMiddleware = require("../middleware/adminMiddleware");
 const requireFreshAdmin = require("../middleware/requireFreshAdmin");
 const { requireSignature, audit } = require("../middleware/requireSignature");
+const Beds24Booking = require("../models/Beds24Booking");
+const { isISODate, nightsBetween } = require("../utils/dates");
 const {
     ConfigError, getConfig,
     planReglas, applyReglas,
     planPropiedad, applyPropiedad,
     planCalendar, applyCalendar,
+    getCalendarView,
 } = require("../services/beds24ConfigService");
 
 const esProduccion = (process.env.NODE_ENV === "production");
@@ -58,6 +61,37 @@ adminConfigRouter.get("/api/admin/config", adminMiddleware, async (req, res) => 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Calendario
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// Vista mensual: precio, estancias y estado de cada día, más las reservas
+// GET /api/admin/config/calendario?from=2026-09-28&to=2026-11-08
+const MAX_VIEW_DAYS = 62;
+adminConfigRouter.get("/api/admin/config/calendario", adminMiddleware, async (req, res) => {
+    const { from, to } = req.query;
+    if (!isISODate(from) || !isISODate(to) || to < from) {
+        return res.status(400).json({ message: "FECHAS_INVALIDAS", detail: "Fechas no válidas (formato AAAA-MM-DD)." });
+    }
+    if (nightsBetween(from, to) + 1 > MAX_VIEW_DAYS) {
+        return res.status(400).json({ message: "RANGO_DEMASIADO_LARGO", detail: `El rango máximo es de ${MAX_VIEW_DAYS} días.` });
+    }
+    try {
+        const [days, bookings] = await Promise.all([
+            getCalendarView(from, to),
+            Beds24Booking.find({
+                deletedInBeds24: false,
+                status: { $ne: "cancelled" },
+                arrival: { $lte: to },
+                departure: { $gt: from },
+            })
+                .sort({ arrival: 1 })
+                .select("beds24Id status source arrival departure nights numAdult numChild firstName lastName -_id")
+                .lean(),
+        ]);
+        res.json({ days, bookings });
+    } catch (error) {
+        sendError(res, error, "Error leyendo el calendario");
+    }
+});
+
 adminConfigRouter.post("/api/admin/config/calendario/preview", adminMiddleware, async (req, res) => {
     try {
         const plan = await planCalendar(req.body);

@@ -124,6 +124,7 @@ async function applyReglas(incoming) {
         body: [{ id: PROPERTY_ID, roomTypes: [room] }],
     }));
     invalidateCalendarCache();
+    invalidateViewCache();
     return changes;
 }
 
@@ -189,6 +190,38 @@ async function fetchCalendarDays(from, to) {
             });
         }
     }
+    return days;
+}
+
+// ---------- Vista mensual (solo lectura) ----------
+// Cada mes gasta 1 crédito de Beds24: se guarda 2 minutos y se borra
+// cuando se aplica un cambio desde el panel.
+const VIEW_TTL = 2 * 60 * 1000;
+const viewCache = new Map();
+
+function invalidateViewCache() {
+    viewCache.clear();
+}
+
+async function getCalendarView(from, to) {
+    const key = `${from}|${to}`;
+    const hit = viewCache.get(key);
+    if (hit && hit.expires > Date.now()) return hit.days;
+
+    const map = await fetchCalendarDays(from, to);
+    const days = [];
+    for (let date = from; date <= to; date = addDays(date, 1)) {
+        const d = map.get(date);
+        days.push({
+            date,
+            price: d?.price ?? null,
+            minStay: d?.minStay ?? null,
+            maxStay: d?.maxStay ?? null,
+            override: d?.override ?? "none",
+        });
+    }
+    viewCache.set(key, { days, expires: Date.now() + VIEW_TTL });
+    if (viewCache.size > 24) viewCache.delete(viewCache.keys().next().value);
     return days;
 }
 
@@ -346,6 +379,7 @@ async function applyCalendar(body) {
         }));
     }
     invalidateCalendarCache();
+    invalidateViewCache();
     return plan;
 }
 
@@ -355,4 +389,5 @@ module.exports = {
     planReglas, applyReglas,
     planPropiedad, applyPropiedad,
     planCalendar, applyCalendar,
+    getCalendarView,
 };
