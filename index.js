@@ -10,14 +10,14 @@ const firebaseRouter = require("./routes/firebaseRouter")
 const adminConfigRouter = require("./routes/adminConfigRouter")
 const adminReservasRouter = require("./routes/adminReservasRouter")
 const adminChannelsRouter = require("./routes/adminChannelsRouter")
+const paymentsRouter = require("./routes/paymentsRouter")
+const reservasRouter = require("./routes/reservasRouter")
+const adminReservasWebRouter = require("./routes/adminReservasWebRouter")
 
 const app = express()
 const PORT = process.env.PORT
 
 app.set('trust proxy', 1); // Para el Rate Limiter
-app.use(urlencoded({ extended: true }))
-app.use(express.json())
-app.use(cookieParser())
 
 dbConnection()
 
@@ -28,12 +28,20 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }))
 
+app.use(paymentsRouter)
+
+app.use(urlencoded({ extended: true }))
+app.use(express.json())
+app.use(cookieParser())
+
 app.use(authRouter)
 app.use(contactRouter)
 app.use(firebaseRouter)
 app.use(adminReservasRouter)
 app.use(adminConfigRouter)
 app.use(adminChannelsRouter)
+app.use(reservasRouter)
+app.use(adminReservasWebRouter)
 
 app.use((req,res) => {
     res.send(`<h1>404 - Not Found</h1>`)

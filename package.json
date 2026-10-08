@@ -23,6 +23,7 @@
     "mongodb": "7.4.0",
     "mongoose": "9.7.3",
     "multer": "2.2.0",
-    "nodemailer": "7.0.13"
+    "nodemailer": "7.0.13",
+    "stripe": "^23.0.0"
   }
 }
