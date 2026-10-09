@@ -4,9 +4,11 @@
 //
 // Ciclo de vida:
 //   pendiente_pago  -> se crea al pulsar «Pagar», ANTES de cobrar
-//   pagada          -> el webhook de Stripe confirma el cobro
+//   pagada          -> el webhook de Stripe confirma el cobro y se crea en Beds24
 //   pago_fallido    -> el pago fue rechazado
-//   cancelada / reembolsada -> gestión posterior desde el panel
+//   cancelada       -> cancelada desde el panel, sin devolver dinero
+//   reembolsada     -> cancelada con reembolso total o parcial (o reembolso
+//                      automático porque las fechas se ocuparon mientras pagaba)
 //
 // Los importes los escribe SIEMPRE el backend (reservasService.cotizarReserva),
 // nunca vienen del front.
@@ -59,22 +61,6 @@ const aceptacionSchema = new mongoose.Schema(
     { _id: false }
 );
 
-// Cada email enviado (o preparado) desde el panel: facturas y mensajes al huésped.
-const comunicacionSchema = new mongoose.Schema(
-    {
-        tipo: { type: String, enum: ["factura", "mensaje"], required: true },
-        destinatario: { type: String, required: true },
-        asunto: { type: String, default: "", maxlength: 200 },
-        mensaje: { type: String, default: "", maxlength: 5000 },
-        // pendiente_envio: preparado pero el envío por email aún no está configurado
-        estado: { type: String, enum: ["pendiente_envio", "enviado", "error"], required: true },
-        error: { type: String, default: "" },
-        creadoPor: { type: String, default: "" },
-        fecha: { type: Date, default: Date.now },
-    },
-    { _id: true }
-);
-
 const cambioEstadoSchema = new mongoose.Schema(
     {
         estado: { type: String, enum: ESTADOS, required: true },
@@ -84,11 +70,25 @@ const cambioEstadoSchema = new mongoose.Schema(
     { _id: false }
 );
 
+// Cancelación y reembolsos (se rellena al cancelar desde el panel).
+const cancelacionSchema = new mongoose.Schema(
+    {
+        fecha: { type: Date, default: null },
+        motivo: { type: String, default: "", maxlength: 300 },
+        por: { type: String, default: "" }, // email del admin o "sistema"
+        reembolsoCentimos: { type: Number, default: 0, min: 0 }, // total devuelto hasta ahora
+        refundIds: { type: [String], default: [] }, // ids de reembolso de Stripe (re_...)
+        beds24Cancelada: { type: Boolean, default: false },
+    },
+    { _id: false }
+);
+
 // ---------- Reserva ----------
 
 const reservaSchema = new mongoose.Schema(
     {
         // Código legible para el huésped y para el panel (ej. QA-7KQ3M9TX).
+        // También se guarda en Beds24 como apiReference.
         codigo: { type: String, required: true, unique: true },
 
         estado: { type: String, enum: ESTADOS, default: "pendiente_pago", index: true },
@@ -151,28 +151,20 @@ const reservaSchema = new mongoose.Schema(
             errorMensaje: { type: String, default: "" },
         },
 
-        // Se rellena cuando la reserva se cree en Beds24 (siguiente paso).
+        // Reserva creada en Beds24 al confirmarse el pago (la reparte a Booking y Airbnb).
         beds24: {
-            bookingId: { type: String, default: null },
+            bookingId: { type: String, default: null, index: true },
             sincronizadoEn: { type: Date, default: null },
             error: { type: String, default: "" },
+            intentos: { type: Number, default: 0 },
         },
 
-        // Factura: el número se asigna UNA vez (correlativo) y no cambia aunque se reenvíe.
-        factura: {
-            numero: { type: String, default: null },
-            fechaEmision: { type: Date, default: null },
-            ultimoEnvio: { type: Date, default: null },
-        },
-
-        comunicaciones: { type: [comunicacionSchema], default: [] },
+        cancelacion: { type: cancelacionSchema, default: null },
     },
     { timestamps: true }
 );
 
 reservaSchema.index({ "pago.paymentIntentId": 1 }, { unique: true, sparse: true });
-reservaSchema.index({ "factura.numero": 1 }, { unique: true, sparse: true });
-reservaSchema.index({ createdAt: -1 });
 
 // Cambia de estado dejando rastro en el historial.
 reservaSchema.methods.cambiarEstado = function (estado, motivo = "") {

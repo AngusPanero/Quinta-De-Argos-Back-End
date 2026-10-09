@@ -3,7 +3,8 @@
 //   POST /intent        -> valida datos y consentimientos, calcula el precio EN EL SERVIDOR,
 //                          guarda la reserva (pendiente_pago) y crea el PaymentIntent
 //   GET  /status/:id    -> estado del pago (para la vuelta de métodos con redirección)
-//   POST /webhook       -> eventos de Stripe (body crudo): marca la reserva como pagada o fallida
+//   POST /webhook       -> eventos de Stripe (body crudo): marca la reserva como pagada
+//                          y la crea en Beds24, o la marca como fallida
 //
 // IMPORTANTE: en index.js, app.use(paymentsRouter) va ANTES de app.use(express.json()),
 // porque el webhook necesita el body sin parsear para verificar la firma.
@@ -18,6 +19,7 @@ const Reserva = require("../models/Reserva");
 const { getNochesOcupadas, invalidarCacheDisponibilidad, Beds24Error } = require("../services/beds24AvailabilityService");
 const { cotizarReserva, limitesReserva, ReservaError } = require("../services/reservasService");
 const { validarDatosCliente } = require("../services/datosClienteService");
+const { sincronizarReservaWeb } = require("../services/reservaWebBeds24Service");
 const { MONEDA } = require("../config/reservasConfig");
 
 const paymentsRouter = express.Router();
@@ -46,14 +48,6 @@ async function buscarReservaDelPago(paymentIntent) {
     return reservaId ? Reserva.findById(reservaId).catch(() => null) : null;
 }
 
-// TODO (siguiente paso): crear la reserva en Beds24.
-// - Idempotente: si reserva.beds24.bookingId ya existe, no duplicar.
-// - Volver a comprobar disponibilidad: si alguien reservó esas fechas mientras
-//   este huésped pagaba (por Booking/Airbnb), reembolsar y avisar.
-async function crearEnBeds24(reserva) {
-    console.log("📅 Pendiente crear en Beds24:", reserva.codigo, reserva.estancia.checkIn, "→", reserva.estancia.checkOut);
-}
-
 async function confirmBooking(paymentIntent) {
     const reserva = await buscarReservaDelPago(paymentIntent);
     if (!reserva) {
@@ -61,19 +55,24 @@ async function confirmBooking(paymentIntent) {
         console.warn("⚠️ Pago sin reserva asociada:", paymentIntent.id);
         return;
     }
-    if (reserva.estado === "pagada") return; // Stripe puede reenviar el evento: no repetimos nada.
+    // Ya cancelada o reembolsada desde el panel: no se vuelve a crear.
+    if (reserva.estado === "cancelada" || reserva.estado === "reembolsada") return;
 
-    reserva.pago.paymentIntentId = paymentIntent.id;
-    reserva.pago.estadoProveedor = paymentIntent.status;
-    reserva.pago.pagadoEn = new Date();
-    reserva.pago.errorMensaje = "";
-    reserva.cambiarEstado("pagada", "Pago confirmado por Stripe");
-    await reserva.save();
+    if (reserva.estado !== "pagada") {
+        reserva.pago.paymentIntentId = paymentIntent.id;
+        reserva.pago.estadoProveedor = paymentIntent.status;
+        reserva.pago.pagadoEn = new Date();
+        reserva.pago.errorMensaje = "";
+        reserva.cambiarEstado("pagada", "Pago confirmado por Stripe");
+        await reserva.save();
+        invalidarCacheDisponibilidad();
+        console.log("✅ Reserva pagada:", reserva.codigo, paymentIntent.id);
+    }
 
-    invalidarCacheDisponibilidad();
-    console.log("✅ Reserva pagada:", reserva.codigo, paymentIntent.id);
-
-    await crearEnBeds24(reserva);
+    // Crea la reserva en Beds24 (no duplica si Stripe reenvía el evento).
+    // Si Beds24 falla, esto lanza: el webhook responde 500 y Stripe lo reintenta.
+    // Mientras tanto aparece en el panel como "pagada sin pasar a Beds24".
+    await sincronizarReservaWeb(reserva, { prueba: paymentIntent.livemode === false });
 }
 
 async function handleFailedPayment(paymentIntent) {
@@ -217,7 +216,7 @@ paymentsRouter.post("/webhook", express.raw({ type: "application/json" }), async
         res.json({ received: true });
     } catch (err) {
         // 500 => Stripe reintenta el envío más tarde
-        console.error("Error procesando webhook:", err);
+        console.error("Error procesando webhook:", err?.message || err);
         res.status(500).send("Error interno");
     }
 });

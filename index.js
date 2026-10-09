@@ -13,6 +13,7 @@ const adminChannelsRouter = require("./routes/adminChannelsRouter")
 const paymentsRouter = require("./routes/paymentsRouter")
 const reservasRouter = require("./routes/reservasRouter")
 const adminReservasWebRouter = require("./routes/adminReservasWebRouter")
+const adminGestionReservasRouter = require("./routes/adminGestionReservasRouter")
 
 const app = express()
 const PORT = process.env.PORT
@@ -42,6 +43,7 @@ app.use(adminConfigRouter)
 app.use(adminChannelsRouter)
 app.use(reservasRouter)
 app.use(adminReservasWebRouter)
+app.use(adminGestionReservasRouter)
 
 app.use((req,res) => {
     res.send(`<h1>404 - Not Found</h1>`)
