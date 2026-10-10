@@ -43,10 +43,28 @@ authRouter.post("/register", async (req, res) => {
     }
 })
 
+async function emailExistsInFirebase(email) {
+    try {
+        await auth.getUserByEmail(email);
+        return true;
+    } catch (err) {
+        if (err.code === "auth/user-not-found") return false;
+        throw err;
+    }
+}
+
 authRouter.post("/login", loginLimiter, async (req, res) => {
     const { email, password } = req.body; 
 
     try {
+        const exists = await emailExistsInFirebase(email);
+        if (!exists) {
+            return res.status(404).json({
+                code: "auth/user-not-found",
+                message: "No existe ninguna cuenta registrada con ese email.",
+            });
+        }
+
         // 1. Validar credenciales contra la API de Firebase Auth
         const firebaseResponse = await axios.post(
             `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${process.env.FIREBASE_API_KEY}`,
