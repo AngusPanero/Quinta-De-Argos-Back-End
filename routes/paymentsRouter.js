@@ -3,8 +3,9 @@
 //   POST /intent        -> valida datos y consentimientos, calcula el precio EN EL SERVIDOR,
 //                          guarda la reserva (pendiente_pago) y crea el PaymentIntent
 //   GET  /status/:id    -> estado del pago (para la vuelta de métodos con redirección)
-//   POST /webhook       -> eventos de Stripe (body crudo): marca la reserva como pagada
-//                          y la crea en Beds24, o la marca como fallida
+//   POST /webhook       -> eventos de Stripe (body crudo): marca la reserva como pagada,
+//                          la crea en Beds24 y envía el correo de confirmación al huésped,
+//                          o la marca como fallida
 //
 // IMPORTANTE: en index.js, app.use(paymentsRouter) va ANTES de app.use(express.json()),
 // porque el webhook necesita el body sin parsear para verificar la firma.
@@ -20,6 +21,7 @@ const { getNochesOcupadas, invalidarCacheDisponibilidad, Beds24Error } = require
 const { cotizarReserva, limitesReserva, ReservaError } = require("../services/reservasService");
 const { validarDatosCliente } = require("../services/datosClienteService");
 const { sincronizarReservaWeb } = require("../services/reservaWebBeds24Service");
+const { enviarEmailConfirmacionReserva } = require("./contactRouter");
 const { MONEDA } = require("../config/reservasConfig");
 
 const paymentsRouter = express.Router();
@@ -72,7 +74,60 @@ async function confirmBooking(paymentIntent) {
     // Crea la reserva en Beds24 (no duplica si Stripe reenvía el evento).
     // Si Beds24 falla, esto lanza: el webhook responde 500 y Stripe lo reintenta.
     // Mientras tanto aparece en el panel como "pagada sin pasar a Beds24".
-    await sincronizarReservaWeb(reserva, { prueba: paymentIntent.livemode === false });
+    const prueba = paymentIntent.livemode === false;
+    const sincronizacion = await sincronizarReservaWeb(reserva, { prueba });
+
+    // Solo se confirma al huésped si la reserva quedó creada en Beds24.
+    // (Si las fechas se ocuparon mientras pagaba, se le reembolsó: no hay confirmación.)
+    if (["creada", "ya_existia", "ya_sincronizada"].includes(sincronizacion.estado)) {
+        await enviarConfirmacionUnaVez(reserva, { prueba });
+    }
+}
+
+// Correo de confirmación al huésped, UNA sola vez aunque Stripe repita el evento.
+// El contenido del correo vive en contactRouter; aquí solo se decide cuándo enviarlo.
+// Si falla el envío no se rompe el webhook: queda registrado y se reintenta
+// la próxima vez que Stripe reenvíe el evento.
+async function enviarConfirmacionUnaVez(reserva, { prueba }) {
+    // Reserva atómica del envío: si dos avisos llegan a la vez, solo uno envía.
+    const reclamada = await Reserva.findOneAndUpdate(
+        { _id: reserva._id, "emails.confirmacionEnviadaEn": null },
+        { $set: { "emails.confirmacionEnviadaEn": new Date() } },
+        { new: true }
+    );
+    if (!reclamada) return; // ya enviada
+
+    let estado = "enviado";
+    let error = "";
+    let asunto = `Reserva confirmada ${reclamada.codigo}`;
+    try {
+        const resultado = await enviarEmailConfirmacionReserva(reclamada, { prueba });
+        asunto = resultado.asunto;
+        console.log("📧 Confirmación enviada:", reclamada.codigo);
+    } catch (mailError) {
+        estado = "error";
+        error = String(mailError?.message || mailError).slice(0, 300);
+        console.error("Error enviando la confirmación de reserva 🔴", reclamada.codigo, error);
+    }
+
+    await Reserva.updateOne(
+        { _id: reclamada._id },
+        {
+            // Si falló, se libera para reintentarlo en el próximo aviso de Stripe.
+            ...(estado === "error" ? { $set: { "emails.confirmacionEnviadaEn": null } } : {}),
+            $push: {
+                comunicaciones: {
+                    tipo: "confirmacion",
+                    destinatario: reclamada.contacto.email,
+                    asunto,
+                    estado,
+                    error,
+                    creadoPor: "sistema",
+                    fecha: new Date(),
+                },
+            },
+        }
+    );
 }
 
 async function handleFailedPayment(paymentIntent) {

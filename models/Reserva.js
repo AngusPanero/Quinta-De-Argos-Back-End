@@ -1,18 +1,3 @@
-// models/Reserva.js — Quinta de Argos
-// Cada intento de reserva desde la web: quién reserva, qué reserva, cuánto
-// cuesta, datos de facturación, consentimientos y estado del pago.
-//
-// Ciclo de vida:
-//   pendiente_pago  -> se crea al pulsar «Pagar», ANTES de cobrar
-//   pagada          -> el webhook de Stripe confirma el cobro y se crea en Beds24
-//   pago_fallido    -> el pago fue rechazado
-//   cancelada       -> cancelada desde el panel, sin devolver dinero
-//   reembolsada     -> cancelada con reembolso total o parcial (o reembolso
-//                      automático porque las fechas se ocuparon mientras pagaba)
-//
-// Los importes los escribe SIEMPRE el backend (reservasService.cotizarReserva),
-// nunca vienen del front.
-
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 
@@ -68,6 +53,22 @@ const cambioEstadoSchema = new mongoose.Schema(
         motivo: { type: String, default: "" },
     },
     { _id: false }
+);
+
+// Cada correo enviado al huésped desde el sistema o el panel.
+const comunicacionSchema = new mongoose.Schema(
+    {
+        // confirmacion: correo automático al aprobarse el pago
+        tipo: { type: String, enum: ["confirmacion", "factura", "mensaje"], required: true },
+        destinatario: { type: String, required: true },
+        asunto: { type: String, default: "", maxlength: 200 },
+        mensaje: { type: String, default: "", maxlength: 5000 },
+        estado: { type: String, enum: ["pendiente_envio", "enviado", "error"], required: true },
+        error: { type: String, default: "" },
+        creadoPor: { type: String, default: "" },
+        fecha: { type: Date, default: Date.now },
+    },
+    { _id: true }
 );
 
 // Cancelación y reembolsos (se rellena al cancelar desde el panel).
@@ -160,11 +161,27 @@ const reservaSchema = new mongoose.Schema(
         },
 
         cancelacion: { type: cancelacionSchema, default: null },
+
+        // Factura: la genera el propietario y la envía adjunta desde el panel.
+        factura: {
+            numero: { type: String, default: null },
+            fechaEmision: { type: Date, default: null },
+            ultimoEnvio: { type: Date, default: null },
+        },
+
+        // Correos automáticos (para no enviarlos dos veces si Stripe repite el aviso).
+        emails: {
+            confirmacionEnviadaEn: { type: Date, default: null },
+        },
+
+        comunicaciones: { type: [comunicacionSchema], default: [] },
     },
     { timestamps: true }
 );
 
 reservaSchema.index({ "pago.paymentIntentId": 1 }, { unique: true, sparse: true });
+reservaSchema.index({ "factura.numero": 1 }, { unique: true, sparse: true });
+reservaSchema.index({ createdAt: -1 });
 
 // Cambia de estado dejando rastro en el historial.
 reservaSchema.methods.cambiarEstado = function (estado, motivo = "") {

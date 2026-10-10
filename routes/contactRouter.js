@@ -3,7 +3,12 @@
 //   1. Envío de correos con la API de Brevo (Render bloquea SMTP).
 //   2. Plantilla HTML de los correos con la marca de Quinta de Argos.
 //   3. Los dos correos: aviso a la finca y acuse de recibo a quien escribe.
-//   4. POST /contact: valida, guarda en Mongo (models/ConsultaContacto) y envía.
+//   4. Correos de reservas: mensaje al huésped, factura adjunta y confirmación de pago.
+//   5. POST /contact: valida, guarda en Mongo (models/ConsultaContacto) y envía.
+//   6. POST /api/admin/reservas-web/:id/factura-adjunta: el propietario sube su
+//      factura (PDF o imagen) y se envía al huésped. Pide la clave de firma.
+//
+// Dependencias: npm install @getbrevo/brevo multer
 //
 // Campos que manda el front: nombre, email, telefono, checkin, checkout, huespedes, mensaje.
 // Se monta en index.js DESPUÉS de express.json().
@@ -17,7 +22,13 @@
 
 const express = require("express");
 const { BrevoClient } = require("@getbrevo/brevo");
+const mongoose = require("mongoose");
+const multer = require("multer");
 const ConsultaContacto = require("../models/ConsultaContacto");
+const Reserva = require("../models/Reserva");
+const adminMiddleware = require("../middleware/adminMiddleware");
+const requireFreshAdmin = require("../middleware/requireFreshAdmin");
+const { requireSignature, audit } = require("../middleware/requireSignature");
 
 const esProduccion = process.env.NODE_ENV === "production";
 
@@ -44,7 +55,7 @@ async function sendMail({ to, subject, html, text, replyTo, attachments = [] }) 
     }
 
     const payload = {
-        sender: { email: process.env.EMAIL_FROM, name: "Quinta de Argos" },
+        sender: { email: process.env.EMAIL_FROM, name: process.env.EMAIL_FROM_NAME || "Quinta de Argos" },
         to: [{ email: to }],
         subject,
         htmlContent: html,
@@ -67,7 +78,7 @@ async function sendMail({ to, subject, html, text, replyTo, attachments = [] }) 
 // 2) PLANTILLA DE LOS CORREOS (logo: public/Isologo_Icon.png de la web)
 // ==========================================================
 
-const WEB_URL = ("https://quintadeargos.com").replace(/\/+$/, "");
+const WEB_URL = (process.env.FRONT_END || "https://quintadeargos.com").replace(/\/+$/, "");
 
 // ---------- Datos de la empresa (cámbialos aquí si cambian) ----------
 const EMPRESA = {
@@ -333,7 +344,7 @@ function telefonoEnlace(tel) {
 }
 
 // ==========================================================
-// 1) Aviso a la finca
+// 3a) Aviso a la finca
 // ==========================================================
 function emailConsultaPropietario(c) {
     const e = resumenEstancia(c);
@@ -412,7 +423,7 @@ function emailConsultaPropietario(c) {
 }
 
 // ==========================================================
-// 2) Acuse de recibo a quien escribió
+// 3b) Acuse de recibo a quien escribió
 // ==========================================================
 function emailAcuseHuesped(c) {
     const e = resumenEstancia(c);
@@ -440,7 +451,7 @@ function emailAcuseHuesped(c) {
         ${parrafo("Si prefieres, también puedes consultar la disponibilidad y reservar directamente en nuestra web, o escribirnos por WhatsApp.")}
 
         <div style="margin:0 0 20px;">
-            ${boton(`${EMPRESA.web}/reservations`, "Ver disponibilidad")}
+            ${boton(`${EMPRESA.web}/reservas`, "Ver disponibilidad")}
             ${boton(EMPRESA.whatsappUrl, "Escribir por WhatsApp", { secundario: true })}
         </div>
     `;
@@ -455,7 +466,7 @@ function emailAcuseHuesped(c) {
         e.noches ? `Duración: ${e.noches}` : null,
         `Huéspedes: ${e.huespedes}`,
         "",
-        `Reserva online: ${EMPRESA.web}/reservations`,
+        `Reserva online: ${EMPRESA.web}/reservas`,
         `WhatsApp: ${EMPRESA.whatsappTexto}`,
         "",
         EMPRESA.nombre,
@@ -479,7 +490,245 @@ function emailAcuseHuesped(c) {
 }
 
 // ==========================================================
-// 4) RUTA POST /contact
+// 4) CORREOS DE RESERVAS: MENSAJE AL HUÉSPED Y FACTURA ADJUNTA
+//    - El mensaje lo usa adminReservasWebRouter (vía services/emailReservaService.js).
+//    - La factura NO se genera aquí: la crea el propietario con su programa o su
+//      gestoría, la adjunta en el panel y aquí solo se envía con un correo de
+//      presentación (ruta de la sección 6, con clave de firma).
+//    Devuelven { enviado: true } o lanzan un error con el motivo.
+// ==========================================================
+
+const BUZON_FINCA = () => process.env.EMAIL_CONTACTO || EMPRESA.email;
+
+function nombreDePila(nombre) {
+    return String(nombre || "").trim().split(/\s+/)[0] || "";
+}
+
+function tablaReserva(reserva, tituloBloque = "Tu reserva") {
+    const n = reserva.noches;
+    return tablaDatos(
+        [
+            { label: "Código", value: reserva.codigo },
+            { label: "Llegada", value: fechaLarga(reserva.checkIn) },
+            { label: "Salida", value: fechaLarga(reserva.checkOut) },
+            { label: "Duración", value: n ? `${n} ${n === 1 ? "noche" : "noches"}` : "" },
+            { label: "Huéspedes", value: reserva.huespedes ? `${reserva.huespedes} ${reserva.huespedes === 1 ? "persona" : "personas"}` : "" },
+        ],
+        tituloBloque
+    );
+}
+
+// ---------- 4a) Mensaje libre del propietario al huésped ----------
+
+/**
+ * @param {{ destinatario: { email, nombre }, asunto, mensaje, reserva: { codigo, checkIn, checkOut, noches, huespedes } }} datos
+ */
+async function enviarEmailMensaje(datos) {
+    const { destinatario, asunto, mensaje, reserva } = datos;
+    const pila = nombreDePila(destinatario.nombre);
+
+    const contenido = `
+        ${etiqueta(`Reserva ${escapeHtml(reserva.codigo)}`)}
+        ${titulo(pila ? `Hola, ${escapeHtml(pila)}` : "Hola")}
+        ${bloqueTexto(mensaje)}
+        ${tablaReserva(reserva)}
+        ${parrafo("Si tienes cualquier duda, responde a este correo o escríbenos por WhatsApp.")}
+        <div style="margin:0 0 20px;">
+            ${boton(EMPRESA.whatsappUrl, "Escribir por WhatsApp", { secundario: true })}
+        </div>
+    `;
+
+    const text = [
+        pila ? `Hola, ${pila}:` : "Hola:",
+        "",
+        mensaje,
+        "",
+        `Reserva ${reserva.codigo}: ${fechaLarga(reserva.checkIn)} → ${fechaLarga(reserva.checkOut)}`,
+        "",
+        `${EMPRESA.nombre} · WhatsApp ${EMPRESA.whatsappTexto}`,
+    ].join("\n");
+
+    await sendMail({
+        to: destinatario.email,
+        subject: asunto,
+        html: layout({
+            tituloDocumento: asunto,
+            preheader: mensaje.slice(0, 120),
+            etiquetaCabecera: "Mensaje de<br />la finca",
+            contenido,
+            notaPie: `Recibes este correo por tu reserva ${escapeHtml(reserva.codigo)} en Quinta de Argos.`,
+        }),
+        text,
+        replyTo: { email: BUZON_FINCA(), name: EMPRESA.nombre },
+    });
+
+    return { enviado: true };
+}
+
+// ---------- 4b) Factura adjunta (el archivo lo sube el propietario) ----------
+
+/**
+ * @param {{
+ *   destinatario: { email: string, nombre: string },
+ *   reserva: { codigo, checkIn, checkOut, noches, huespedes },
+ *   archivo: { filename: string, content: Buffer },
+ *   numero?: string,   // nº de factura (opcional, solo para mostrarlo)
+ *   nota?: string      // texto opcional del propietario
+ * }} datos
+ */
+async function enviarEmailFactura(datos) {
+    const { destinatario, reserva, archivo, numero, nota } = datos || {};
+    if (!archivo?.content?.length) throw new Error("Falta el archivo de la factura");
+
+    const pila = nombreDePila(destinatario.nombre);
+    const asunto = numero ? `Factura ${numero} — Quinta de Argos` : "Tu factura — Quinta de Argos";
+
+    const contenido = `
+        ${etiqueta(numero ? `Factura ${escapeHtml(numero)}` : "Factura")}
+        ${titulo(pila ? `Tu factura, ${escapeHtml(pila)}` : "Tu factura")}
+        ${parrafo("Te enviamos adjunta la factura de tu estancia en Quinta de Argos. Guárdala como justificante.")}
+        ${nota ? bloqueTexto(nota) : ""}
+        ${tablaDatos(
+            [
+                { label: "Archivo adjunto", value: archivo.filename },
+                { label: "Nº de factura", value: numero || "" },
+            ],
+            "Documento"
+        )}
+        ${tablaReserva(reserva, "Estancia")}
+        ${parrafo("Si necesitas corregir algún dato de facturación, responde a este correo.")}
+    `;
+
+    await sendMail({
+        to: destinatario.email,
+        subject: asunto,
+        html: layout({
+            tituloDocumento: asunto,
+            preheader: "Te enviamos adjunta la factura de tu estancia.",
+            etiquetaCabecera: "Tu<br />factura",
+            contenido,
+            notaPie: `Factura de tu reserva ${escapeHtml(reserva.codigo)} en Quinta de Argos.`,
+        }),
+        text: [
+            pila ? `Hola, ${pila}:` : "Hola:",
+            "",
+            "Te enviamos adjunta la factura de tu estancia en Quinta de Argos.",
+            nota ? `\n${nota}\n` : "",
+            `Reserva ${reserva.codigo}: ${fechaLarga(reserva.checkIn)} → ${fechaLarga(reserva.checkOut)}`,
+            "",
+            EMPRESA.nombre,
+        ].join("\n"),
+        replyTo: { email: BUZON_FINCA(), name: EMPRESA.nombre },
+        attachments: [archivo],
+    });
+
+    return { enviado: true };
+}
+
+// ---------- 4c) Confirmación de reserva (al aprobarse el pago) ----------
+// La llama routes/paymentsRouter.js cuando Stripe confirma el cobro y la reserva
+// ya está creada en Beds24. Aquí solo se arma y se envía el correo: cuándo
+// enviarlo (y no repetirlo) lo decide paymentsRouter.
+
+const formatoEuros = (valor) =>
+    Number(valor || 0).toLocaleString("es-ES", { style: "currency", currency: "EUR", minimumFractionDigits: 2 });
+
+/**
+ * @param {object} reserva  documento de models/Reserva (o su toObject())
+ * @param {{ prueba?: boolean }} [opciones]  prueba: pago en modo test de Stripe
+ * @returns {Promise<{ enviado: true, asunto: string }>}
+ */
+async function enviarEmailConfirmacionReserva(reserva, { prueba = false } = {}) {
+    const r = typeof reserva?.toObject === "function" ? reserva.toObject() : reserva;
+    if (!r?.contacto?.email) throw new Error("La reserva no tiene email de contacto");
+
+    const pila = nombreDePila(r.contacto.nombre);
+    const asunto = `${prueba ? "[PRUEBA] " : ""}Reserva confirmada ${r.codigo} — Quinta de Argos`;
+
+    // Noches agrupadas por precio: "2 noches × 197,00 €"
+    const grupos = new Map();
+    for (const noche of r.importes?.desglose ?? []) grupos.set(noche.precio, (grupos.get(noche.precio) ?? 0) + 1);
+    const filasImporte = [
+        ...[...grupos.entries()].map(([precio, n]) => ({
+            label: `${n} ${n === 1 ? "noche" : "noches"} × ${formatoEuros(precio)}`,
+            value: formatoEuros(precio * n),
+        })),
+        ...(r.importes?.adicionales ?? []).map((a) => ({ label: a.nombre, value: formatoEuros(a.precio) })),
+        {
+            label: "Total pagado",
+            value: `<strong>${escapeHtml(formatoEuros(r.importes?.total))}</strong>`,
+            html: true,
+        },
+    ];
+
+    const contenido = `
+        ${etiqueta("Reserva confirmada")}
+        ${titulo(pila ? `¡Te esperamos, ${escapeHtml(pila)}!` : "¡Te esperamos!")}
+        ${parrafo(`Hemos recibido tu pago y tu reserva en Quinta de Argos está confirmada. Guarda este correo: tu código de reserva es <strong>${escapeHtml(r.codigo)}</strong>.`)}
+        ${prueba ? parrafo("<em>Este correo corresponde a un pago de prueba: no es una reserva real.</em>") : ""}
+
+        ${divisor}
+
+        ${tablaReserva(
+            {
+                codigo: r.codigo,
+                checkIn: r.estancia?.checkIn,
+                checkOut: r.estancia?.checkOut,
+                noches: r.estancia?.noches,
+                huespedes: r.estancia?.huespedes,
+            },
+            "Tu estancia"
+        )}
+
+        ${tablaDatos(filasImporte, "Importe (IVA incluido)")}
+
+        ${parrafo("Unos días antes de tu llegada te escribiremos con las indicaciones para llegar y la entrada a la finca. Si necesitas cualquier cosa antes, responde a este correo o escríbenos por WhatsApp.")}
+
+        <div style="margin:0 0 20px;">
+            ${boton(EMPRESA.whatsappUrl, "Escribir por WhatsApp")}
+            ${boton(`${EMPRESA.web}/policy-terms`, "Condiciones de reserva", { secundario: true })}
+        </div>
+    `;
+
+    const text = [
+        pila ? `¡Te esperamos, ${pila}!` : "¡Te esperamos!",
+        "",
+        `Tu reserva en Quinta de Argos está confirmada. Código: ${r.codigo}`,
+        prueba ? "(Pago de prueba: no es una reserva real.)" : null,
+        "",
+        `Llegada: ${fechaLarga(r.estancia?.checkIn)}`,
+        `Salida: ${fechaLarga(r.estancia?.checkOut)}`,
+        `Huéspedes: ${r.estancia?.huespedes}`,
+        `Total pagado: ${formatoEuros(r.importes?.total)} (IVA incluido)`,
+        "",
+        `WhatsApp: ${EMPRESA.whatsappTexto}`,
+        `Condiciones de reserva: ${EMPRESA.web}/policy-terms`,
+        "",
+        EMPRESA.nombre,
+        EMPRESA.localidad,
+    ]
+        .filter((l) => l !== null)
+        .join("\n");
+
+    await sendMail({
+        to: r.contacto.email,
+        subject: asunto,
+        html: layout({
+            tituloDocumento: asunto,
+            preheader: `Reserva ${r.codigo} · ${fechaLarga(r.estancia?.checkIn)} → ${fechaLarga(r.estancia?.checkOut)}`,
+            etiquetaCabecera: "Reserva<br />confirmada",
+            contenido,
+            notaPie: `Recibes este correo porque has reservado en quintadeargos.com (reserva ${escapeHtml(r.codigo)}).`,
+        }),
+        text,
+        replyTo: { email: BUZON_FINCA(), name: EMPRESA.nombre },
+    });
+
+    return { enviado: true, asunto };
+}
+
+// ==========================================================
+// 5) RUTA POST /contact
 // ==========================================================
 
 const contactRouter = express.Router();
@@ -622,5 +871,164 @@ contactRouter.post("/contact", limiteContacto, async (req, res) => {
     return res.status(201).json({ mensaje: "Consulta enviada correctamente." });
 });
 
+// ==========================================================
+// 6) RUTA POST /api/admin/reservas-web/:id/factura-adjunta
+//    El propietario adjunta SU factura (PDF/JPG/PNG) y se envía al huésped
+//    con el correo de presentación. Protecciones: admin + Firebase en el
+//    momento + clave de firma (mismo bloqueo y auditoría que el calendario).
+//
+//    multipart/form-data:
+//      factura  archivo (obligatorio)
+//      numero   nº de factura (opcional, para el panel y el correo)
+//      nota     texto opcional para el huésped
+//      pin      clave de firma
+// ==========================================================
+
+const MAX_FACTURA_BYTES = 5 * 1024 * 1024; // 5 MB: Brevo limita el tamaño total del correo
+const TIPOS_FACTURA = { "application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png" };
+// La firma comparte sección con el resto del panel (bloqueo y auditoría en configaudits).
+const SECCION_FIRMA_FACTURA = "calendario";
+
+const subidaFactura = multer({
+    storage: multer.memoryStorage(), // no se guarda en disco: va directa al correo
+    limits: { fileSize: MAX_FACTURA_BYTES, files: 1, fields: 10 },
+    fileFilter: (req, file, cb) => {
+        if (TIPOS_FACTURA[file.mimetype]) return cb(null, true);
+        const error = new Error("TIPO_NO_PERMITIDO");
+        error.code = "TIPO_NO_PERMITIDO";
+        return cb(error);
+    },
+}).single("factura");
+
+// multer con errores en el mismo formato que el resto del panel
+function recibirFactura(req, res, next) {
+    subidaFactura(req, res, (error) => {
+        if (!error) return next();
+        const mensaje =
+            error.code === "LIMIT_FILE_SIZE"
+                ? "El archivo pesa demasiado (máximo 5 MB)."
+                : error.code === "TIPO_NO_PERMITIDO"
+                  ? "La factura tiene que ser un PDF, JPG o PNG."
+                  : "No se ha podido leer el archivo.";
+        return res.status(400).json({ message: "ARCHIVO_INVALIDO", mensaje, detail: mensaje });
+    });
+}
+
+// Nombre de archivo seguro para el adjunto.
+function nombreArchivoSeguro(original, mimetype, numero) {
+    const ext = TIPOS_FACTURA[mimetype] || "";
+    const base = String(numero || original || "factura")
+        .replace(/\.[^.]+$/, "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^A-Za-z0-9._-]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 80);
+    return `${numero ? "Factura-" : ""}${base || "factura"}${ext}`;
+}
+
+const facturaEnCurso = new Set();
+const quienEnvia = (req) => req.freshAdmin?.email || req.user?.email || "admin";
+
+contactRouter.post(
+    "/api/admin/reservas-web/:id/factura-adjunta",
+    adminMiddleware,
+    requireFreshAdmin,
+    recibirFactura, // primero el archivo: así req.body.pin existe para la firma
+    requireSignature(SECCION_FIRMA_FACTURA),
+    async (req, res) => {
+        const { id } = req.params;
+        if (!mongoose.isValidObjectId(id)) {
+            return res.status(400).json({ mensaje: "Identificador de reserva no válido." });
+        }
+        if (!req.file) {
+            return res.status(400).json({ mensaje: "Adjunta el archivo de la factura." });
+        }
+        if (facturaEnCurso.has(id)) {
+            return res.status(409).json({ mensaje: "Ya se está enviando una factura de esta reserva. Espera unos segundos." });
+        }
+
+        const numero = typeof req.body?.numero === "string" ? req.body.numero.trim().slice(0, 40) : "";
+        const nota = typeof req.body?.nota === "string" ? req.body.nota.trim().slice(0, 2000) : "";
+
+        facturaEnCurso.add(id);
+        try {
+            const reserva = await Reserva.findById(id);
+            if (!reserva) return res.status(404).json({ mensaje: "La reserva no existe." });
+            if (["pendiente_pago", "pago_fallido"].includes(reserva.estado)) {
+                return res.status(409).json({ mensaje: "Esta reserva no llegó a cobrarse: no se puede enviar una factura." });
+            }
+
+            const archivo = {
+                filename: nombreArchivoSeguro(req.file.originalname, req.file.mimetype, numero),
+                content: req.file.buffer,
+            };
+
+            let envio;
+            try {
+                envio = await enviarEmailFactura({
+                    destinatario: { email: reserva.contacto.email, nombre: reserva.contacto.nombre },
+                    reserva: {
+                        codigo: reserva.codigo,
+                        checkIn: reserva.estancia.checkIn,
+                        checkOut: reserva.estancia.checkOut,
+                        noches: reserva.estancia.noches,
+                        huespedes: reserva.estancia.huespedes,
+                    },
+                    archivo,
+                    numero,
+                    nota,
+                });
+            } catch (error) {
+                envio = { enviado: false, error: error?.message || "Error desconocido" };
+            }
+
+            // Registro en la reserva (el archivo no se guarda: solo su nombre).
+            reserva.comunicaciones.push({
+                tipo: "factura",
+                destinatario: reserva.contacto.email,
+                asunto: numero ? `Factura ${numero}` : `Factura (${archivo.filename})`,
+                mensaje: [nota, `Adjunto: ${archivo.filename}`].filter(Boolean).join("\n\n").slice(0, 5000),
+                estado: envio.enviado ? "enviado" : "error",
+                error: envio.error || "",
+                creadoPor: quienEnvia(req),
+            });
+            if (envio.enviado) {
+                if (numero) reserva.factura.numero = numero;
+                if (!reserva.factura.fechaEmision) reserva.factura.fechaEmision = new Date();
+                reserva.factura.ultimoEnvio = new Date();
+            }
+
+            try {
+                await reserva.save();
+            } catch (error) {
+                if (error?.code === 11000) {
+                    return res.status(409).json({ mensaje: `El número ${numero} ya está asignado a otra reserva.`, envio });
+                }
+                throw error;
+            }
+
+            await audit(req, SECCION_FIRMA_FACTURA, envio.enviado ? "ok" : "error", {
+                accion: "enviar_factura",
+                codigo: reserva.codigo,
+                numero: numero || null,
+                archivo: archivo.filename,
+            });
+
+            res.json({ reserva: reserva.toObject({ versionKey: false }), envio, factura: { numero: numero || null } });
+        } catch (error) {
+            console.error(esProduccion ? "Error enviando la factura adjunta 🔴" : `Error enviando la factura adjunta 🔴 ${error}`);
+            res.status(500).json({ mensaje: "No se ha podido enviar la factura." });
+        } finally {
+            facturaEnCurso.delete(id);
+        }
+    }
+);
+
 module.exports = contactRouter;
 module.exports.validarConsulta = validarConsulta;
+// Para services/emailReservaService.js (mensajes y facturas del panel de reservas)
+module.exports.enviarEmailMensaje = enviarEmailMensaje;
+module.exports.enviarEmailFactura = enviarEmailFactura;
+// Para routes/paymentsRouter.js (pago aprobado)
+module.exports.enviarEmailConfirmacionReserva = enviarEmailConfirmacionReserva;
