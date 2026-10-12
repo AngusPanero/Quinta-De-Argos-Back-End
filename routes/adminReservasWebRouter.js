@@ -3,7 +3,6 @@ const mongoose = require("mongoose");
 const adminMiddleware = require("../middleware/adminMiddleware");
 const Reserva = require("../models/Reserva");
 const { asignarNumeroFactura, construirDatosFactura } = require("../services/facturaService");
-const { enviarEmailFactura, enviarEmailMensaje } = require("../services/emailReservaService");
 
 const adminReservasWebRouter = express.Router();
 

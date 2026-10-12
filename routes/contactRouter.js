@@ -483,7 +483,7 @@ function emailAcuseHuesped(c) {
 //    - La factura NO se genera aquí: la crea el propietario con su programa o su
 //      gestoría, la adjunta en el panel y aquí solo se envía con un correo de
 //      presentación (ruta de la sección 6, con clave de firma).
-//    Devuelven { enviado: true } o lanzan un error con el motivo.
+//    Devuelven { enviado: true } o lanzan un error con el motivo
 // ==========================================================
 
 const BUZON_FINCA = () => process.env.EMAIL_CONTACTO || EMPRESA.email;
