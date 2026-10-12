@@ -798,7 +798,7 @@ function unirMarcas(...marcas) {
  * @param {{ reserva, marca, comunicacion?: string, etiquetaLog: string, enviar: (r) => Promise<{ asunto: string }> }} p
  */
 async function enviarUnaVez({ reserva, marca, comunicacion, etiquetaLog, enviar }) {
-    const r = await Reserva.findOneAndUpdate({ _id: reserva._id, ...marca.filtro }, marca.cambio, { new: true });
+    const r = await Reserva.findOneAndUpdate({ _id: reserva._id, ...marca.filtro }, marca.cambio, { returnDocument: "after" });
     if (!r) return "ya_enviado";
 
     let estado = "enviado";
