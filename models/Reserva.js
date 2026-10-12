@@ -179,8 +179,18 @@ const reservaSchema = new mongoose.Schema(
     { timestamps: true }
 );
 
-reservaSchema.index({ "pago.paymentIntentId": 1 }, { unique: true, sparse: true });
-reservaSchema.index({ "factura.numero": 1 }, { unique: true, sparse: true });
+// Únicos solo cuando hay un valor real. Con "sparse" los null SÍ cuentan
+// (el campo existe con valor null), y la segunda reserva sin PaymentIntent
+// o sin factura daba E11000. Con partialFilterExpression solo se indexan
+// los documentos donde el campo es un string.
+reservaSchema.index(
+    { "pago.paymentIntentId": 1 },
+    { unique: true, partialFilterExpression: { "pago.paymentIntentId": { $type: "string" } } }
+);
+reservaSchema.index(
+    { "factura.numero": 1 },
+    { unique: true, partialFilterExpression: { "factura.numero": { $type: "string" } } }
+);
 reservaSchema.index({ createdAt: -1 });
 
 // Cambia de estado dejando rastro en el historial.
