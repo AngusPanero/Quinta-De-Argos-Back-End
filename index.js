@@ -14,6 +14,7 @@ const paymentsRouter = require("./routes/paymentsRouter")
 const reservasRouter = require("./routes/reservasRouter")
 const adminReservasWebRouter = require("./routes/adminReservasWebRouter")
 const adminGestionReservasRouter = require("./routes/adminGestionReservasRouter")
+const { startBeds24TarifasJob } = require("./data/tarifas")
 
 const app = express()
 const PORT = process.env.PORT
@@ -34,6 +35,8 @@ app.use(paymentsRouter)
 app.use(urlencoded({ extended: true }))
 app.use(express.json())
 app.use(cookieParser())
+
+startBeds24TarifasJob()
 
 app.use(authRouter)
 app.use(contactRouter)

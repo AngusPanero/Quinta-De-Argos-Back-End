@@ -6,7 +6,7 @@
 // sin hora ni zona). Una "noche" se identifica por el día en que empieza:
 // llegada 10/11 y salida 13/11 = noches 10, 11 y 12.
 
-const { VIGENCIA, TARIFAS } = require("../data/tarifas");
+const { tarifaDe: tarifaSegunReglas } = require("../data/tarifas");
 const {
     MIN_DIAS_ANTELACION,
     MIN_HORAS_ANTELACION,
@@ -75,23 +75,11 @@ function limitesReserva(ahora = new Date()) {
 }
 
 // ---------- Tarifas ----------
-// Devuelve { precio, minNoches } o null si ese día no se vende online.
 function tarifaDe(fecha) {
-    if (fecha < VIGENCIA.desde || fecha > VIGENCIA.hasta) return null;
-    const t = TARIFAS[fecha.slice(5)];
-    if (!t || typeof t.precio !== "number" || !(t.precio > 0)) return null;
-    const minNoches = Number.isInteger(t.minNoches) && t.minNoches > 0 ? t.minNoches : 1;
-    return { precio: t.precio, minNoches };
+    return tarifaSegunReglas(fecha);
 }
 
 // ---------- Calendario público ----------
-/**
- * Estado de cada noche entre hoy y el final del horizonte.
- *   libre       se puede reservar (incluye precio y estancia mínima)
- *   ocupado     ya reservado o bloqueado en Beds24
- *   sin_tarifa  no tiene precio cargado: no se vende online
- *   antelacion  dentro de las 72 h mínimas
- */
 function construirCalendario(ocupadas, ahora = new Date()) {
     const { hoy, primeraLlegada, ultimaNoche } = limitesReserva(ahora);
     const dias = {};
