@@ -78,7 +78,7 @@ const EMPRESA = {
     whatsappUrl: "https://wa.me/34633491825",
     web: WEB_URL,
     webTexto: WEB_URL.replace(/^https?:\/\//, ""),
-    logoUrl: `https://res.cloudinary.com/dhqzn8gwi/image/upload/v1791837243/sboz3aawcb2nfqvyviyl.jpg`,
+    logoUrl: `${WEB_URL}/Isologo_Icon.png`,
 };
 
 // ---------- Paleta de la marca ----------
@@ -1401,7 +1401,7 @@ contactRouter.post("/contact", limiteContacto, async (req, res) => {
 });
 
 // ==========================================================
-// 6) RUTA POST /api/admin/reservations-web/:id/factura-adjunta
+// 6) RUTA POST /api/admin/reservas-web/:id/factura-adjunta
 //    El propietario adjunta SU factura (PDF/JPG/PNG) y se envía al huésped
 //    con el correo de presentación. Protecciones: admin + Firebase en el
 //    momento + clave de firma (mismo bloqueo y auditoría que el calendario).
@@ -1460,7 +1460,7 @@ const facturaEnCurso = new Set();
 const quienEnvia = (req) => req.freshAdmin?.email || req.user?.email || "admin";
 
 contactRouter.post(
-    "/api/admin/reservations-web/:id/factura-adjunta",
+    "/api/admin/reservas-web/:id/factura-adjunta",
     adminMiddleware,
     requireFreshAdmin,
     recibirFactura, // primero el archivo: así req.body.pin existe para la firma
@@ -1553,6 +1553,62 @@ contactRouter.post(
         }
     }
 );
+
+// ==========================================================
+// 7) RUTA POST /api/admin/reservas-web/:id/mensaje
+//    Mensaje libre del propietario al huésped (sin clave de firma).
+//    Body JSON: { asunto, mensaje }
+// ==========================================================
+contactRouter.post("/api/admin/reservas-web/:id/mensaje", adminMiddleware, async (req, res) => {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+        return res.status(400).json({ mensaje: "Identificador de reserva no válido." });
+    }
+
+    const asunto = typeof req.body?.asunto === "string" ? req.body.asunto.trim().slice(0, 200) : "";
+    const mensaje = typeof req.body?.mensaje === "string" ? req.body.mensaje.trim().slice(0, 5000) : "";
+    if (asunto.length < 2) return res.status(400).json({ mensaje: "Escribe un asunto." });
+    if (mensaje.length < 2) return res.status(400).json({ mensaje: "Escribe el mensaje." });
+
+    try {
+        const reserva = await Reserva.findById(id);
+        if (!reserva) return res.status(404).json({ mensaje: "La reserva no existe." });
+
+        let envio;
+        try {
+            envio = await enviarEmailMensaje({
+                destinatario: { email: reserva.contacto.email, nombre: reserva.contacto.nombre },
+                asunto,
+                mensaje,
+                reserva: {
+                    codigo: reserva.codigo,
+                    checkIn: reserva.estancia.checkIn,
+                    checkOut: reserva.estancia.checkOut,
+                    noches: reserva.estancia.noches,
+                    huespedes: reserva.estancia.huespedes,
+                },
+            });
+        } catch (error) {
+            envio = { enviado: false, error: error?.message || "Error desconocido" };
+        }
+
+        reserva.comunicaciones.push({
+            tipo: "mensaje",
+            destinatario: reserva.contacto.email,
+            asunto,
+            mensaje,
+            estado: envio.enviado ? "enviado" : "error",
+            error: envio.error || "",
+            creadoPor: quienEnvia(req),
+        });
+        await reserva.save();
+
+        res.json({ reserva: reserva.toObject({ versionKey: false }), envio });
+    } catch (error) {
+        console.error(esProduccion ? "Error enviando el mensaje 🔴" : `Error enviando el mensaje 🔴 ${error}`);
+        res.status(500).json({ mensaje: "No se ha podido enviar el mensaje." });
+    }
+});
 
 module.exports = contactRouter;
 module.exports.validarConsulta = validarConsulta;
