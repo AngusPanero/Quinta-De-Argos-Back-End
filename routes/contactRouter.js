@@ -49,6 +49,7 @@ const brevo = new BrevoClient({ apiKey: process.env.BREVO_API_KEY });
  * @param {{ email: string, name?: string }} [opciones.replyTo]  a quién se responde
  * @param {{ filename: string, content: Buffer }[]} [opciones.attachments]
  */
+
 async function sendMail({ to, subject, html, text, replyTo, attachments = [] }) {
     if (!process.env.BREVO_API_KEY || !process.env.EMAIL_FROM) {
         throw new Error("Faltan BREVO_API_KEY o EMAIL_FROM");
@@ -71,7 +72,17 @@ async function sendMail({ to, subject, html, text, replyTo, attachments = [] }) 
         }));
     }
 
-    await brevo.transactionalEmails.sendTransacEmail(payload);
+    // ↓ Esto es lo nuevo: reemplaza la línea "await brevo.transactionalEmails.sendTransacEmail(payload);"
+    try {
+        const respuesta = await brevo.transactionalEmails.sendTransacEmail(payload);
+        const messageId = respuesta?.messageId ?? respuesta?.body?.messageId;
+        console.log(`✉️ Brevo OK → ${to} | ${subject} | ${messageId ?? "sin messageId"}`);
+        return { messageId };
+    } catch (err) {
+        const detalle = err?.body ?? err?.response?.body ?? err?.message;
+        console.error(`❌ Brevo error → ${to} | ${subject} |`, JSON.stringify(detalle));
+        throw err;
+    }
 }
 
 // ==========================================================
