@@ -3,9 +3,15 @@
 //   POST /intent        -> valida datos y consentimientos, calcula el precio EN EL SERVIDOR,
 //                          guarda la reserva (pendiente_pago) y crea el PaymentIntent
 //   GET  /status/:id    -> estado del pago (para la vuelta de métodos con redirección)
-//   POST /webhook       -> eventos de Stripe (body crudo): marca la reserva como pagada,
-//                          la crea en Beds24 y envía el correo de confirmación al huésped,
-//                          o la marca como fallida
+//   POST /webhook       -> eventos de Stripe (body crudo):
+//        payment_intent.processing      pago pendiente           -> aviso al huésped y a la finca
+//        payment_intent.succeeded       pago aprobado            -> pagada, Beds24, confirmación + aviso a la finca
+//        payment_intent.payment_failed  pago rechazado           -> pago_fallido (+ aviso si estaba pendiente)
+//        payment_intent.canceled        pago cancelado en Stripe -> cancelada (+ aviso si estaba pendiente)
+//        charge.refunded                reembolso                -> aviso de cancelación/reembolso
+//
+// Todos los correos los arma y envía notificarReserva() de contactRouter.
+// Aquí solo se decide CUÁNDO avisar.
 //
 // IMPORTANTE: en index.js, app.use(paymentsRouter) va ANTES de app.use(express.json()),
 // porque el webhook necesita el body sin parsear para verificar la firma.
@@ -21,10 +27,12 @@ const { getNochesOcupadas, invalidarCacheDisponibilidad, Beds24Error } = require
 const { cotizarReserva, limitesReserva, ReservaError } = require("../services/reservasService");
 const { validarDatosCliente } = require("../services/datosClienteService");
 const { sincronizarReservaWeb } = require("../services/reservaWebBeds24Service");
-const { enviarEmailConfirmacionReserva } = require("./contactRouter");
+const { notificarReserva } = require("./contactRouter");
 const { MONEDA } = require("../config/reservasConfig");
 
 const paymentsRouter = express.Router();
+
+const esperar = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---------- Helpers ----------
 
@@ -50,6 +58,7 @@ async function buscarReservaDelPago(paymentIntent) {
     return reservaId ? Reserva.findById(reservaId).catch(() => null) : null;
 }
 
+// ---------- Pago aprobado ----------
 async function confirmBooking(paymentIntent) {
     const reserva = await buscarReservaDelPago(paymentIntent);
     if (!reserva) {
@@ -77,59 +86,38 @@ async function confirmBooking(paymentIntent) {
     const prueba = paymentIntent.livemode === false;
     const sincronizacion = await sincronizarReservaWeb(reserva, { prueba });
 
-    // Solo se confirma al huésped si la reserva quedó creada en Beds24.
-    // (Si las fechas se ocuparon mientras pagaba, se le reembolsó: no hay confirmación.)
+    // Solo se confirma si la reserva quedó creada en Beds24. Si las fechas se
+    // ocuparon mientras pagaba, se le reembolsó: el aviso de cancelación y
+    // reembolso llega por charge.refunded.
     if (["creada", "ya_existia", "ya_sincronizada"].includes(sincronizacion.estado)) {
-        await enviarConfirmacionUnaVez(reserva, { prueba });
+        const actual = (await Reserva.findById(reserva._id)) || reserva;
+        const avisos = await notificarReserva("confirmada", actual, { prueba });
+        console.log("📨 Avisos de reserva confirmada:", reserva.codigo, avisos);
     }
 }
 
-// Correo de confirmación al huésped, UNA sola vez aunque Stripe repita el evento.
-// El contenido del correo vive en contactRouter; aquí solo se decide cuándo enviarlo.
-// Si falla el envío no se rompe el webhook: queda registrado y se reintenta
-// la próxima vez que Stripe reenvíe el evento.
-async function enviarConfirmacionUnaVez(reserva, { prueba }) {
-    // Reserva atómica del envío: si dos avisos llegan a la vez, solo uno envía.
-    const reclamada = await Reserva.findOneAndUpdate(
-        { _id: reserva._id, "emails.confirmacionEnviadaEn": null },
-        { $set: { "emails.confirmacionEnviadaEn": new Date() } },
-        { new: true }
-    );
-    if (!reclamada) return; // ya enviada
-
-    let estado = "enviado";
-    let error = "";
-    let asunto = `Reserva confirmada ${reclamada.codigo}`;
-    try {
-        const resultado = await enviarEmailConfirmacionReserva(reclamada, { prueba });
-        asunto = resultado.asunto;
-        console.log("📧 Confirmación enviada:", reclamada.codigo);
-    } catch (mailError) {
-        estado = "error";
-        error = String(mailError?.message || mailError).slice(0, 300);
-        console.error("Error enviando la confirmación de reserva 🔴", reclamada.codigo, error);
+// ---------- Pago pendiente (SEPA y otros métodos que tardan) ----------
+async function handleProcessingPayment(paymentIntent) {
+    const reserva = await buscarReservaDelPago(paymentIntent);
+    if (!reserva) {
+        console.warn("⚠️ Pago pendiente sin reserva asociada:", paymentIntent.id);
+        return;
     }
+    // Si ya está pagada o cerrada, este aviso llega tarde: no se toca.
+    if (!["pendiente_pago", "pago_fallido"].includes(reserva.estado)) return;
 
-    await Reserva.updateOne(
-        { _id: reclamada._id },
-        {
-            // Si falló, se libera para reintentarlo en el próximo aviso de Stripe.
-            ...(estado === "error" ? { $set: { "emails.confirmacionEnviadaEn": null } } : {}),
-            $push: {
-                comunicaciones: {
-                    tipo: "confirmacion",
-                    destinatario: reclamada.contacto.email,
-                    asunto,
-                    estado,
-                    error,
-                    creadoPor: "sistema",
-                    fecha: new Date(),
-                },
-            },
-        }
-    );
+    reserva.pago.paymentIntentId = paymentIntent.id;
+    reserva.pago.estadoProveedor = paymentIntent.status;
+    reserva.pago.errorMensaje = "";
+    if (reserva.estado === "pago_fallido") reserva.cambiarEstado("pendiente_pago", "Nuevo intento de pago en proceso");
+    await reserva.save();
+    console.log("⏳ Pago pendiente:", reserva.codigo, paymentIntent.id);
+
+    const avisos = await notificarReserva("pendiente", reserva, { prueba: paymentIntent.livemode === false });
+    console.log("📨 Avisos de pago pendiente:", reserva.codigo, avisos);
 }
 
+// ---------- Pago rechazado ----------
 async function handleFailedPayment(paymentIntent) {
     const reserva = await buscarReservaDelPago(paymentIntent);
     const mensaje = paymentIntent.last_payment_error?.message || "Pago rechazado";
@@ -140,6 +128,65 @@ async function handleFailedPayment(paymentIntent) {
     reserva.pago.errorMensaje = mensaje.slice(0, 300);
     reserva.cambiarEstado("pago_fallido", mensaje.slice(0, 300));
     await reserva.save();
+
+    // Solo avisa si antes se avisó de que el pago estaba pendiente.
+    const avisos = await notificarReserva("fallido", reserva, {
+        prueba: paymentIntent.livemode === false,
+        mensaje,
+    });
+    console.log("📨 Avisos de pago fallido:", reserva.codigo, avisos);
+}
+
+// ---------- Pago cancelado en Stripe ----------
+async function handleCanceledPayment(paymentIntent) {
+    const reserva = await buscarReservaDelPago(paymentIntent);
+    if (!reserva || !["pendiente_pago", "pago_fallido"].includes(reserva.estado)) return;
+
+    const motivo = `Pago cancelado en Stripe${paymentIntent.cancellation_reason ? ` (${paymentIntent.cancellation_reason})` : ""}`;
+    reserva.pago.estadoProveedor = paymentIntent.status;
+    reserva.cambiarEstado("cancelada", motivo);
+    await reserva.save();
+    console.warn("🚫", motivo, reserva.codigo);
+
+    const avisos = await notificarReserva("fallido", reserva, {
+        prueba: paymentIntent.livemode === false,
+        mensaje: "El pago se ha cancelado",
+    });
+    console.log("📨 Avisos de pago cancelado:", reserva.codigo, avisos);
+}
+
+// ---------- Reembolsos (cancelaciones del panel, fechas ocupadas o desde Stripe) ----------
+async function handleChargeRefunded(charge) {
+    const paymentIntentId = typeof charge.payment_intent === "string" ? charge.payment_intent : charge.payment_intent?.id;
+    if (!paymentIntentId) return;
+
+    let reserva = await Reserva.findOne({ "pago.paymentIntentId": paymentIntentId });
+    if (!reserva) {
+        console.warn("⚠️ Reembolso sin reserva asociada:", paymentIntentId);
+        return;
+    }
+
+    // Al cancelar desde el panel, el reembolso se pide a Stripe y justo después
+    // la reserva se marca como cancelada. Si este aviso llega antes, esperamos un
+    // momento para mandar el correo correcto (cancelación + reembolso).
+    if (reserva.estado === "pagada") {
+        await esperar(4000);
+        reserva = (await Reserva.findById(reserva._id)) || reserva;
+    }
+
+    const { data } = await stripe.refunds.list({ payment_intent: paymentIntentId, limit: 100 });
+    const reembolsos = data
+        .filter((r) => r.status === "succeeded" || r.status === "pending")
+        .sort((a, b) => a.created - b.created);
+    const totalReembolsadoCentimos = reembolsos.reduce((suma, r) => suma + r.amount, 0);
+    const prueba = charge.livemode === false;
+
+    // Cada reembolso se avisa una sola vez (por su id), aunque Stripe repita el evento.
+    for (const refund of reembolsos) {
+        const actual = (await Reserva.findById(reserva._id)) || reserva;
+        const avisos = await notificarReserva("reembolso", actual, { refund, totalReembolsadoCentimos, prueba });
+        console.log("📨 Avisos de reembolso:", reserva.codigo, refund.id, avisos);
+    }
 }
 
 // ---------- 1) Guardar reserva y crear PaymentIntent ----------
@@ -259,19 +306,28 @@ paymentsRouter.post("/webhook", express.raw({ type: "application/json" }), async
 
     try {
         switch (event.type) {
+            case "payment_intent.processing":
+                await handleProcessingPayment(event.data.object);
+                break;
             case "payment_intent.succeeded":
                 await confirmBooking(event.data.object);
                 break;
             case "payment_intent.payment_failed":
                 await handleFailedPayment(event.data.object);
                 break;
+            case "payment_intent.canceled":
+                await handleCanceledPayment(event.data.object);
+                break;
+            case "charge.refunded":
+                await handleChargeRefunded(event.data.object);
+                break;
             default:
                 break;
         }
         res.json({ received: true });
     } catch (err) {
-        // 500 => Stripe reintenta el envío más tarde
-        console.error("Error procesando webhook:", err?.message || err);
+        // 500 => Stripe reintenta el envío más tarde (los correos no se duplican)
+        console.error("Error procesando webhook:", event.type, err?.message || err);
         res.status(500).send("Error interno");
     }
 });

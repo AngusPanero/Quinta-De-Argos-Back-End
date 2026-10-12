@@ -58,8 +58,14 @@ const cambioEstadoSchema = new mongoose.Schema(
 // Cada correo enviado al huésped desde el sistema o el panel.
 const comunicacionSchema = new mongoose.Schema(
     {
-        // confirmacion: correo automático al aprobarse el pago
-        tipo: { type: String, enum: ["confirmacion", "factura", "mensaje"], required: true },
+        // Automáticos (los envía notificarReserva de contactRouter):
+        //   confirmacion, pago_pendiente, pago_fallido, cancelacion, reembolso
+        // Desde el panel: factura, mensaje
+        tipo: {
+            type: String,
+            enum: ["confirmacion", "pago_pendiente", "pago_fallido", "cancelacion", "reembolso", "factura", "mensaje"],
+            required: true,
+        },
         destinatario: { type: String, required: true },
         asunto: { type: String, default: "", maxlength: 200 },
         mensaje: { type: String, default: "", maxlength: 5000 },
@@ -169,9 +175,22 @@ const reservaSchema = new mongoose.Schema(
             ultimoEnvio: { type: Date, default: null },
         },
 
-        // Correos automáticos (para no enviarlos dos veces si Stripe repite el aviso).
+        // Correos automáticos: marcas para no enviarlos dos veces si Stripe repite el aviso.
         emails: {
+            // Al huésped
             confirmacionEnviadaEn: { type: Date, default: null },
+            pendienteEnviadaEn: { type: Date, default: null },
+            fallidoEnviadoEn: { type: Date, default: null },
+            cancelacionEnviadaEn: { type: Date, default: null },
+            reembolsosNotificados: { type: [String], default: [] }, // ids de reembolso de Stripe (re_...)
+            // A la finca (EMAIL_CONTACTO, por defecto quintadeargos@gmail.com)
+            finca: {
+                confirmada: { type: Date, default: null },
+                pendiente: { type: Date, default: null },
+                fallido: { type: Date, default: null },
+                cancelacion: { type: Date, default: null },
+                reembolsos: { type: [String], default: [] },
+            },
         },
 
         comunicaciones: { type: [comunicacionSchema], default: [] },

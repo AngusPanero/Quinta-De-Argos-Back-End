@@ -50,7 +50,6 @@ async function sendMail({ to, subject, html, text, replyTo, attachments = [] }) 
         }));
     }
 
-    // ↓ Esto es lo nuevo: reemplaza la línea "await brevo.transactionalEmails.sendTransacEmail(payload);"
     try {
         const respuesta = await brevo.transactionalEmails.sendTransacEmail(payload);
         const messageId = respuesta?.messageId ?? respuesta?.body?.messageId;
@@ -615,9 +614,7 @@ async function enviarEmailFactura(datos) {
 }
 
 // ---------- 4c) Confirmación de reserva (al aprobarse el pago) ----------
-// La llama routes/paymentsRouter.js cuando Stripe confirma el cobro y la reserva
-// ya está creada en Beds24. Aquí solo se arma y se envía el correo: cuándo
-// enviarlo (y no repetirlo) lo decide paymentsRouter.
+// La usa notificarReserva("confirmada", ...) de la sección 4d.
 
 const formatoEuros = (valor) =>
     Number(valor || 0).toLocaleString("es-ES", { style: "currency", currency: "EUR", minimumFractionDigits: 2 });
@@ -714,6 +711,549 @@ async function enviarEmailConfirmacionReserva(reserva, { prueba = false } = {}) 
     });
 
     return { enviado: true, asunto };
+}
+
+// ==========================================================
+// 4d) AVISOS DE RESERVA AL HUÉSPED Y A LA FINCA
+//     Una sola función para paymentsRouter: notificarReserva(evento, reserva, opciones)
+//
+//       "pendiente"   el pago tarda en confirmarse (SEPA u otros métodos diferidos)
+//       "confirmada"  pago aprobado: confirmación al huésped y aviso a la finca
+//                     (si antes estuvo pendiente, la finca recibe "pago aprobado")
+//       "fallido"     el pago que estaba pendiente se rechaza o se cancela
+//       "reembolso"   reembolso emitido en Stripe. Si la reserva está cancelada,
+//                     el primer aviso es el de cancelación con su reembolso;
+//                     los siguientes reembolsos se avisan como "reembolso".
+//
+//     Cada correo sale UNA sola vez aunque Stripe repita el evento: antes de
+//     enviar se reclama una marca en reserva.emails de forma atómica. Si el
+//     envío falla, la marca se libera y se reintenta en el siguiente aviso.
+//     Los correos al huésped quedan en reserva.comunicaciones; los de la finca
+//     (EMAIL_CONTACTO, por defecto quintadeargos@gmail.com) solo en los logs.
+// ==========================================================
+
+const centimosAEuros = (centimos) => formatoEuros((Number(centimos) || 0) / 100);
+const prefijoPrueba = (prueba) => (prueba ? "[PRUEBA] " : "");
+const avisoPrueba = (prueba) => (prueba ? parrafo("<em>Corresponde a un pago de prueba: no es una reserva real.</em>") : "");
+const fechasCortas = (r) => `${r.estancia?.checkIn} → ${r.estancia?.checkOut}`;
+const leerRuta = (obj, ruta) => ruta.split(".").reduce((o, k) => o?.[k], obj);
+const estaCancelada = (r) => ["cancelada", "reembolsada"].includes(r.estado);
+const botonWhatsApp = () => boton(EMPRESA.whatsappUrl, "Escribir por WhatsApp", { secundario: true });
+
+function estanciaDe(r) {
+    return {
+        codigo: r.codigo,
+        checkIn: r.estancia?.checkIn,
+        checkOut: r.estancia?.checkOut,
+        noches: r.estancia?.noches,
+        huespedes: r.estancia?.huespedes,
+    };
+}
+
+// Noches agrupadas por precio + adicionales + total.
+function filasImporteDe(r) {
+    const grupos = new Map();
+    for (const noche of r.importes?.desglose ?? []) grupos.set(noche.precio, (grupos.get(noche.precio) ?? 0) + 1);
+    return [
+        ...[...grupos.entries()].map(([precio, n]) => ({
+            label: `${n} ${n === 1 ? "noche" : "noches"} × ${formatoEuros(precio)}`,
+            value: formatoEuros(precio * n),
+        })),
+        ...(r.importes?.adicionales ?? []).map((a) => ({ label: a.nombre, value: formatoEuros(a.precio) })),
+        { label: "Total", value: `<strong>${escapeHtml(formatoEuros(r.importes?.total))}</strong>`, html: true },
+    ];
+}
+
+// ---------- Marcas de "ya enviado" en reserva.emails ----------
+
+const marcaFecha = (ruta) => ({
+    filtro: { [ruta]: null },
+    cambio: { $set: { [ruta]: new Date() } },
+    deshacer: { $set: { [ruta]: null } },
+});
+
+const marcaLista = (ruta, valor) => ({
+    filtro: { [ruta]: { $ne: valor } },
+    cambio: { $addToSet: { [ruta]: valor } },
+    deshacer: { $pull: { [ruta]: valor } },
+});
+
+function unirMarcas(...marcas) {
+    const unir = (clave) => {
+        const salida = {};
+        for (const m of marcas) {
+            for (const [op, valor] of Object.entries(m[clave])) salida[op] = { ...(salida[op] || {}), ...valor };
+        }
+        return salida;
+    };
+    return {
+        filtro: Object.assign({}, ...marcas.map((m) => m.filtro)),
+        cambio: unir("cambio"),
+        deshacer: unir("deshacer"),
+    };
+}
+
+/**
+ * Reclama la marca, envía y registra. Devuelve "enviado" | "error" | "ya_enviado".
+ * @param {{ reserva, marca, comunicacion?: string, etiquetaLog: string, enviar: (r) => Promise<{ asunto: string }> }} p
+ */
+async function enviarUnaVez({ reserva, marca, comunicacion, etiquetaLog, enviar }) {
+    const r = await Reserva.findOneAndUpdate({ _id: reserva._id, ...marca.filtro }, marca.cambio, { new: true });
+    if (!r) return "ya_enviado";
+
+    let estado = "enviado";
+    let error = "";
+    let asunto = "";
+    try {
+        asunto = (await enviar(r))?.asunto || "";
+        console.log(`📧 ${etiquetaLog}:`, r.codigo);
+    } catch (e) {
+        estado = "error";
+        error = String(e?.message || e).slice(0, 300);
+        console.error(`Error enviando ${etiquetaLog} 🔴`, r.codigo, esProduccion ? "" : error);
+    }
+
+    // Si falló, se libera la marca para reintentarlo en el próximo aviso de Stripe.
+    const cambio = estado === "error" ? { ...marca.deshacer } : {};
+    if (comunicacion) {
+        cambio.$push = {
+            comunicaciones: {
+                tipo: comunicacion,
+                destinatario: r.contacto.email,
+                asunto: (asunto || etiquetaLog).slice(0, 200),
+                estado,
+                error,
+                creadoPor: "sistema",
+                fecha: new Date(),
+            },
+        };
+    }
+    if (Object.keys(cambio).length) await Reserva.updateOne({ _id: r._id }, cambio);
+
+    return estado;
+}
+
+// ---------- Correos al huésped ----------
+
+async function correoAlHuesped(r, { asunto, etiquetaCabecera, preheader, contenido, text }) {
+    await sendMail({
+        to: r.contacto.email,
+        subject: asunto,
+        html: layout({
+            tituloDocumento: asunto,
+            preheader,
+            etiquetaCabecera,
+            contenido,
+            notaPie: `Recibes este correo por tu reserva ${escapeHtml(r.codigo)} en quintadeargos.com.`,
+        }),
+        text,
+        replyTo: { email: BUZON_FINCA(), name: EMPRESA.nombre },
+    });
+    return { asunto };
+}
+
+function correoPagoPendiente(r, { prueba }) {
+    const pila = nombreDePila(r.contacto?.nombre);
+    return correoAlHuesped(r, {
+        asunto: `${prefijoPrueba(prueba)}Pago en proceso: reserva ${r.codigo} — Quinta de Argos`,
+        etiquetaCabecera: "Pago en<br />proceso",
+        preheader: `Reserva ${r.codigo} · estamos esperando la confirmación de tu banco.`,
+        contenido: `
+            ${etiqueta("Pago en proceso")}
+            ${titulo(pila ? `Gracias, ${escapeHtml(pila)}` : "Gracias")}
+            ${parrafo(`Hemos recibido tu solicitud de reserva <strong>${escapeHtml(r.codigo)}</strong>. Tu banco todavía está procesando el pago: según el método elegido, puede tardar desde unos minutos hasta unos días hábiles.`)}
+            ${parrafo("En cuanto se confirme el cobro te enviaremos la confirmación de la reserva. No tienes que hacer nada más.")}
+            ${avisoPrueba(prueba)}
+            ${divisor}
+            ${tablaReserva(estanciaDe(r), "Tu solicitud")}
+            ${tablaDatos(filasImporteDe(r), "Importe (IVA incluido)")}
+            ${parrafo("Si tienes cualquier duda, responde a este correo o escríbenos por WhatsApp.")}
+            <div style="margin:0 0 20px;">${botonWhatsApp()}</div>`,
+        text: [
+            pila ? `Gracias, ${pila}.` : "Gracias.",
+            "",
+            `Hemos recibido tu solicitud de reserva ${r.codigo}. Tu banco todavía está procesando el pago.`,
+            "En cuanto se confirme el cobro te enviaremos la confirmación de la reserva.",
+            "",
+            `Llegada: ${fechaLarga(r.estancia?.checkIn)}`,
+            `Salida: ${fechaLarga(r.estancia?.checkOut)}`,
+            `Total: ${formatoEuros(r.importes?.total)} (IVA incluido)`,
+            "",
+            `${EMPRESA.nombre} · WhatsApp ${EMPRESA.whatsappTexto}`,
+        ].join("\n"),
+    });
+}
+
+function correoPagoFallido(r, { prueba }) {
+    const pila = nombreDePila(r.contacto?.nombre);
+    return correoAlHuesped(r, {
+        asunto: `${prefijoPrueba(prueba)}No se ha completado el pago de tu reserva ${r.codigo} — Quinta de Argos`,
+        etiquetaCabecera: "Pago no<br />completado",
+        preheader: `Reserva ${r.codigo} · el pago no se ha completado.`,
+        contenido: `
+            ${etiqueta("Pago no completado")}
+            ${titulo(pila ? `Lo sentimos, ${escapeHtml(pila)}` : "Lo sentimos")}
+            ${parrafo(`Tu banco no ha completado el pago de la reserva <strong>${escapeHtml(r.codigo)}</strong>, así que la reserva no se ha confirmado y no se te cobrará.`)}
+            ${parrafo("Si quieres, puedes volver a intentarlo desde la web con otro método de pago, o escribirnos y te ayudamos.")}
+            ${avisoPrueba(prueba)}
+            ${divisor}
+            ${tablaReserva(estanciaDe(r), "La reserva que intentabas hacer")}
+            <div style="margin:0 0 20px;">
+                ${boton(`${EMPRESA.web}/reservations`, "Volver a reservar")}
+                ${botonWhatsApp()}
+            </div>`,
+        text: [
+            pila ? `Lo sentimos, ${pila}.` : "Lo sentimos.",
+            "",
+            `Tu banco no ha completado el pago de la reserva ${r.codigo}: la reserva no se ha confirmado y no se te cobrará.`,
+            `Puedes volver a intentarlo en ${EMPRESA.web}/reservations o escribirnos por WhatsApp (${EMPRESA.whatsappTexto}).`,
+            "",
+            EMPRESA.nombre,
+        ].join("\n"),
+    });
+}
+
+/** Cancelación con reembolso (primer aviso de una reserva cancelada) o reembolso suelto. */
+function correoReembolso(r, { cancelada, importeCentimos, totalReembolsadoCentimos, prueba }) {
+    const pila = nombreDePila(r.contacto?.nombre);
+    const importe = centimosAEuros(importeCentimos);
+    const pagado = centimosAEuros(r.importes?.totalCentimos);
+    const total = centimosAEuros(totalReembolsadoCentimos);
+    const porSistema = cancelada && r.cancelacion?.por === "sistema";
+
+    const asunto = cancelada
+        ? `${prefijoPrueba(prueba)}Reserva cancelada ${r.codigo} — Quinta de Argos`
+        : `${prefijoPrueba(prueba)}Reembolso de ${importe}: reserva ${r.codigo} — Quinta de Argos`;
+
+    return correoAlHuesped(r, {
+        asunto,
+        etiquetaCabecera: cancelada ? "Reserva<br />cancelada" : "Reembolso<br />emitido",
+        preheader: cancelada
+            ? `Reserva ${r.codigo} cancelada · reembolso de ${importe}.`
+            : `Reembolso de ${importe} de tu reserva ${r.codigo}.`,
+        contenido: `
+            ${etiqueta(cancelada ? "Reserva cancelada" : "Reembolso emitido")}
+            ${titulo(pila ? `Hola, ${escapeHtml(pila)}` : "Hola")}
+            ${cancelada ? parrafo(`Tu reserva <strong>${escapeHtml(r.codigo)}</strong> en Quinta de Argos ha quedado cancelada.`) : ""}
+            ${porSistema ? parrafo("Lo sentimos: mientras se procesaba tu pago, esas fechas se ocuparon y no hemos podido confirmar tu estancia.") : ""}
+            ${parrafo(`Hemos emitido un reembolso de <strong>${escapeHtml(importe)}</strong>${cancelada ? "" : ` de tu reserva <strong>${escapeHtml(r.codigo)}</strong>`} al mismo medio de pago que usaste. Según tu banco, puede tardar entre 5 y 10 días hábiles en aparecer en tu cuenta.`)}
+            ${avisoPrueba(prueba)}
+            ${divisor}
+            ${tablaDatos(
+                [
+                    { label: "Este reembolso", value: importe },
+                    { label: "Total reembolsado", value: `${total} de ${pagado}` },
+                ],
+                "Reembolso"
+            )}
+            ${tablaReserva(estanciaDe(r), cancelada ? "Reserva cancelada" : "Tu reserva")}
+            ${parrafo("Si tienes cualquier duda, responde a este correo o escríbenos por WhatsApp.")}
+            <div style="margin:0 0 20px;">
+                ${cancelada ? boton(`${EMPRESA.web}/reservations`, "Volver a reservar") : ""}
+                ${botonWhatsApp()}
+            </div>`,
+        text: [
+            pila ? `Hola, ${pila}:` : "Hola:",
+            "",
+            cancelada ? `Tu reserva ${r.codigo} en Quinta de Argos ha quedado cancelada.` : null,
+            `Hemos emitido un reembolso de ${importe} al mismo medio de pago que usaste.`,
+            "Según tu banco, puede tardar entre 5 y 10 días hábiles en aparecer en tu cuenta.",
+            `Total reembolsado: ${total} de ${pagado}`,
+            "",
+            `${EMPRESA.nombre} · WhatsApp ${EMPRESA.whatsappTexto}`,
+        ]
+            .filter((l) => l !== null)
+            .join("\n"),
+    });
+}
+
+// ---------- Avisos a la finca ----------
+
+const AVISOS_FINCA = {
+    confirmada: {
+        etiqueta: "Nueva reserva",
+        cabecera: "Nueva<br />reserva",
+        asunto: (r) => `Nueva reserva ${r.codigo} · ${fechasCortas(r)} · ${formatoEuros(r.importes?.total)}`,
+        intro: () =>
+            "Pago confirmado. La reserva ya está creada en Beds24, así que las fechas quedan bloqueadas también en Booking y Airbnb.",
+    },
+    aprobada: {
+        etiqueta: "Pago aprobado",
+        cabecera: "Pago<br />aprobado",
+        asunto: (r) => `Pago aprobado: reserva ${r.codigo} confirmada · ${fechasCortas(r)}`,
+        intro: () =>
+            "El pago que estaba pendiente se ha confirmado. La reserva ya está creada en Beds24 y las fechas quedan bloqueadas.",
+    },
+    pendiente: {
+        etiqueta: "Pago pendiente",
+        cabecera: "Pago<br />pendiente",
+        asunto: (r) => `Pago pendiente: reserva ${r.codigo} · ${fechasCortas(r)}`,
+        intro: () =>
+            "El huésped ha pagado con un método que tarda en confirmarse. <strong>Las fechas todavía no están bloqueadas en Beds24</strong>: se bloquearán cuando el banco confirme el cobro, y te avisaremos.",
+    },
+    fallido: {
+        etiqueta: "Pago no completado",
+        cabecera: "Pago no<br />completado",
+        asunto: (r) => `Pago no completado: reserva ${r.codigo} · ${fechasCortas(r)}`,
+        intro: (r, x) =>
+            `El pago que estaba pendiente no se ha completado${x.mensaje ? ` (${escapeHtml(x.mensaje)})` : ""}. La reserva no se ha confirmado ni se ha creado en Beds24.`,
+    },
+    cancelacion: {
+        etiqueta: "Reserva cancelada",
+        cabecera: "Reserva<br />cancelada",
+        asunto: (r, x) => `Reserva cancelada ${r.codigo} · reembolso ${centimosAEuros(x.importeCentimos)}`,
+        intro: (r, x) =>
+            `La reserva está cancelada y se ha emitido un reembolso de <strong>${escapeHtml(centimosAEuros(x.importeCentimos))}</strong> al huésped.`,
+    },
+    reembolso: {
+        etiqueta: "Reembolso emitido",
+        cabecera: "Reembolso<br />emitido",
+        asunto: (r, x) => `Reembolso de ${centimosAEuros(x.importeCentimos)}: reserva ${r.codigo}`,
+        intro: (r, x) =>
+            `Se ha emitido un reembolso de <strong>${escapeHtml(centimosAEuros(x.importeCentimos))}</strong> al huésped.${
+                estaCancelada(r) ? "" : " <strong>La reserva sigue activa</strong>: el reembolso no la ha cancelado."
+            }`,
+    },
+};
+
+async function correoFinca(r, tipo, extra = {}) {
+    const aviso = AVISOS_FINCA[tipo];
+    const asunto = `${prefijoPrueba(extra.prueba)}${aviso.asunto(r, extra)}`;
+
+    const email = r.contacto?.email || "";
+    const telefono = r.contacto?.telefono || "";
+    const telWa = telefonoEnlace(telefono).replace(/^\+/, "");
+    const f = r.facturacion || {};
+    const d = f.direccion || {};
+    const direccion = [d.linea1, d.linea2, [d.codigoPostal, d.ciudad].filter(Boolean).join(" "), d.provincia, d.pais]
+        .filter(Boolean)
+        .join(", ");
+
+    const bloqueReembolso =
+        extra.importeCentimos != null
+            ? tablaDatos(
+                  [
+                      { label: "Este reembolso", value: centimosAEuros(extra.importeCentimos) },
+                      {
+                          label: "Total reembolsado",
+                          value: `${centimosAEuros(extra.totalReembolsadoCentimos)} de ${centimosAEuros(r.importes?.totalCentimos)}`,
+                      },
+                  ],
+                  "Reembolso"
+              )
+            : "";
+
+    const bloqueCancelacion =
+        estaCancelada(r) && (r.cancelacion?.por || r.cancelacion?.motivo)
+            ? tablaDatos(
+                  [
+                      { label: "Cancelada por", value: r.cancelacion?.por },
+                      { label: "Motivo", value: r.cancelacion?.motivo },
+                  ],
+                  "Cancelación"
+              )
+            : "";
+
+    const contenido = `
+        ${etiqueta(aviso.etiqueta)}
+        ${titulo(`${escapeHtml(r.contacto?.nombre || "Huésped")} · ${escapeHtml(r.codigo)}`)}
+        ${parrafo(aviso.intro(r, extra))}
+        ${avisoPrueba(extra.prueba)}
+        ${divisor}
+        ${bloqueReembolso}
+        ${bloqueCancelacion}
+        ${tablaDatos(
+            [
+                { label: "Nombre", value: r.contacto?.nombre },
+                {
+                    label: "Email",
+                    value: `<a href="mailto:${escapeHtml(email)}" style="color:${C.arcilla}; text-decoration:none;">${escapeHtml(email)}</a>`,
+                    html: true,
+                },
+                {
+                    label: "Teléfono",
+                    value: `<a href="tel:${escapeHtml(telefonoEnlace(telefono))}" style="color:${C.tinta}; text-decoration:none;">${escapeHtml(telefono)}</a>`,
+                    html: true,
+                },
+            ],
+            "Huésped"
+        )}
+        ${tablaReserva(estanciaDe(r), "Estancia")}
+        ${tablaDatos(filasImporteDe(r), "Importe (IVA incluido)")}
+        ${tablaDatos(
+            [
+                { label: "Tipo", value: f.tipo === "empresa" ? "Empresa" : "Particular" },
+                { label: f.tipo === "empresa" ? "Razón social" : "Nombre", value: f.nombre },
+                { label: "Documento", value: [f.tipoDocumento, f.documento].filter(Boolean).join(" ") },
+                { label: "Dirección", value: direccion },
+                { label: "Acepta publicidad", value: r.consentimientos?.comunicacionesComerciales?.aceptado ? "Sí" : "No" },
+            ],
+            "Datos de facturación"
+        )}
+        <div style="margin:0 0 20px;">
+            ${boton(`mailto:${email}?subject=${encodeURIComponent(`Tu reserva ${r.codigo} en Quinta de Argos`)}`, "Responder por email")}
+            ${telWa ? boton(`https://wa.me/${telWa}`, "Escribir por WhatsApp", { secundario: true }) : ""}
+        </div>`;
+
+    const text = [
+        `${aviso.etiqueta} — ${r.codigo}`,
+        "",
+        `Huésped: ${r.contacto?.nombre} · ${email} · ${telefono}`,
+        `Llegada: ${fechaLarga(r.estancia?.checkIn)}`,
+        `Salida: ${fechaLarga(r.estancia?.checkOut)}`,
+        `Huéspedes: ${r.estancia?.huespedes}`,
+        `Total: ${formatoEuros(r.importes?.total)} (IVA incluido)`,
+        extra.importeCentimos != null ? `Reembolso: ${centimosAEuros(extra.importeCentimos)}` : null,
+        r.cancelacion?.motivo && estaCancelada(r) ? `Motivo de la cancelación: ${r.cancelacion.motivo}` : null,
+    ]
+        .filter((l) => l !== null)
+        .join("\n");
+
+    await sendMail({
+        to: BUZON_FINCA(),
+        subject: asunto,
+        html: layout({
+            tituloDocumento: asunto,
+            preheader: `${r.contacto?.nombre} · ${fechasCortas(r)} · ${formatoEuros(r.importes?.total)}`,
+            etiquetaCabecera: aviso.cabecera,
+            contenido,
+            notaPie: "Aviso automático de reservas de quintadeargos.com.",
+        }),
+        text,
+        replyTo: email ? { email, name: r.contacto?.nombre } : undefined, // «Responder» contesta al huésped
+    });
+
+    return { asunto };
+}
+
+// ---------- Reembolso: primero como cancelación si toca, si no como reembolso ----------
+
+async function avisarReembolso({ reserva, refundId, rutaCancelacion, rutaLista, comunicacion, etiquetaLog, enviar }) {
+    const marcaReembolso = marcaLista(rutaLista, refundId);
+
+    if (estaCancelada(reserva) && !leerRuta(reserva, rutaCancelacion)) {
+        const estado = await enviarUnaVez({
+            reserva,
+            marca: unirMarcas(marcaFecha(rutaCancelacion), marcaReembolso),
+            comunicacion: comunicacion ? "cancelacion" : undefined,
+            etiquetaLog: `cancelación ${etiquetaLog}`,
+            enviar: (r) => enviar(r, true),
+        });
+        if (estado !== "ya_enviado") return estado;
+    }
+
+    return enviarUnaVez({
+        reserva,
+        marca: marcaReembolso,
+        comunicacion,
+        etiquetaLog: `reembolso ${etiquetaLog}`,
+        enviar: (r) => enviar(r, false),
+    });
+}
+
+// ---------- Función pública ----------
+
+/**
+ * @param {"pendiente" | "confirmada" | "fallido" | "reembolso"} evento
+ * @param {object} reserva  documento de models/Reserva (recién leído)
+ * @param {{
+ *   prueba?: boolean,                    // pago en modo test de Stripe
+ *   mensaje?: string,                    // "fallido": motivo del banco
+ *   refund?: { id: string, amount: number },  // "reembolso"
+ *   totalReembolsadoCentimos?: number    // "reembolso"
+ * }} [opciones]
+ * @returns {Promise<{ huesped: string, finca: string }>}  "enviado" | "error" | "ya_enviado" | "omitido"
+ */
+async function notificarReserva(evento, reserva, opciones = {}) {
+    const { prueba = false } = opciones;
+    if (!reserva?._id) throw new Error("notificarReserva necesita una reserva guardada");
+
+    switch (evento) {
+        case "pendiente": {
+            const huesped = await enviarUnaVez({
+                reserva,
+                marca: marcaFecha("emails.pendienteEnviadaEn"),
+                comunicacion: "pago_pendiente",
+                etiquetaLog: "aviso de pago pendiente al huésped",
+                enviar: (r) => correoPagoPendiente(r, { prueba }),
+            });
+            const finca = await enviarUnaVez({
+                reserva,
+                marca: marcaFecha("emails.finca.pendiente"),
+                etiquetaLog: "aviso de pago pendiente a la finca",
+                enviar: (r) => correoFinca(r, "pendiente", { prueba }),
+            });
+            return { huesped, finca };
+        }
+
+        case "confirmada": {
+            const huesped = await enviarUnaVez({
+                reserva,
+                marca: marcaFecha("emails.confirmacionEnviadaEn"),
+                comunicacion: "confirmacion",
+                etiquetaLog: "confirmación al huésped",
+                enviar: (r) => enviarEmailConfirmacionReserva(r, { prueba }),
+            });
+            const finca = await enviarUnaVez({
+                reserva,
+                marca: marcaFecha("emails.finca.confirmada"),
+                etiquetaLog: "aviso de reserva a la finca",
+                enviar: (r) => correoFinca(r, r.emails?.finca?.pendiente ? "aprobada" : "confirmada", { prueba }),
+            });
+            return { huesped, finca };
+        }
+
+        case "fallido": {
+            // Solo se avisa si antes se avisó del pago pendiente. Si una tarjeta se
+            // rechaza en el momento, el huésped ya lo ve en pantalla.
+            const huesped = reserva.emails?.pendienteEnviadaEn
+                ? await enviarUnaVez({
+                      reserva,
+                      marca: marcaFecha("emails.fallidoEnviadoEn"),
+                      comunicacion: "pago_fallido",
+                      etiquetaLog: "aviso de pago fallido al huésped",
+                      enviar: (r) => correoPagoFallido(r, { prueba }),
+                  })
+                : "omitido";
+            const finca = reserva.emails?.finca?.pendiente
+                ? await enviarUnaVez({
+                      reserva,
+                      marca: marcaFecha("emails.finca.fallido"),
+                      etiquetaLog: "aviso de pago fallido a la finca",
+                      enviar: (r) => correoFinca(r, "fallido", { prueba, mensaje: opciones.mensaje }),
+                  })
+                : "omitido";
+            return { huesped, finca };
+        }
+
+        case "reembolso": {
+            const { refund, totalReembolsadoCentimos = 0 } = opciones;
+            if (!refund?.id) throw new Error("notificarReserva('reembolso') necesita el refund de Stripe");
+            const datos = { importeCentimos: refund.amount, totalReembolsadoCentimos, prueba };
+
+            const huesped = await avisarReembolso({
+                reserva,
+                refundId: refund.id,
+                rutaCancelacion: "emails.cancelacionEnviadaEn",
+                rutaLista: "emails.reembolsosNotificados",
+                comunicacion: "reembolso",
+                etiquetaLog: "al huésped",
+                enviar: (r, cancelada) => correoReembolso(r, { ...datos, cancelada }),
+            });
+            const finca = await avisarReembolso({
+                reserva,
+                refundId: refund.id,
+                rutaCancelacion: "emails.finca.cancelacion",
+                rutaLista: "emails.finca.reembolsos",
+                etiquetaLog: "a la finca",
+                enviar: (r, cancelada) => correoFinca(r, cancelada ? "cancelacion" : "reembolso", datos),
+            });
+            return { huesped, finca };
+        }
+
+        default:
+            throw new Error(`Evento de aviso desconocido: ${evento}`);
+    }
 }
 
 // ==========================================================
@@ -861,7 +1401,7 @@ contactRouter.post("/contact", limiteContacto, async (req, res) => {
 });
 
 // ==========================================================
-// 6) RUTA POST /api/admin/reservas-web/:id/factura-adjunta
+// 6) RUTA POST /api/admin/reservations-web/:id/factura-adjunta
 //    El propietario adjunta SU factura (PDF/JPG/PNG) y se envía al huésped
 //    con el correo de presentación. Protecciones: admin + Firebase en el
 //    momento + clave de firma (mismo bloqueo y auditoría que el calendario).
@@ -1019,5 +1559,6 @@ module.exports.validarConsulta = validarConsulta;
 // Para services/emailReservaService.js (mensajes y facturas del panel de reservas)
 module.exports.enviarEmailMensaje = enviarEmailMensaje;
 module.exports.enviarEmailFactura = enviarEmailFactura;
-// Para routes/paymentsRouter.js (pago aprobado)
+// Para routes/paymentsRouter.js: todos los avisos de reserva (huésped y finca)
+module.exports.notificarReserva = notificarReserva;
 module.exports.enviarEmailConfirmacionReserva = enviarEmailConfirmacionReserva;
