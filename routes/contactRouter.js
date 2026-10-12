@@ -1,25 +1,3 @@
-// routes/contactRouter.js — Quinta de Argos
-// Formulario de contacto (ContactCorporate.tsx) en un solo archivo:
-//   1. Envío de correos con la API de Brevo (Render bloquea SMTP).
-//   2. Plantilla HTML de los correos con la marca de Quinta de Argos.
-//   3. Los dos correos: aviso a la finca y acuse de recibo a quien escribe.
-//   4. Correos de reservas: mensaje al huésped, factura adjunta y confirmación de pago.
-//   5. POST /contact: valida, guarda en Mongo (models/ConsultaContacto) y envía.
-//   6. POST /api/admin/reservas-web/:id/factura-adjunta: el propietario sube su
-//      factura (PDF o imagen) y se envía al huésped. Pide la clave de firma.
-//
-// Dependencias: npm install @getbrevo/brevo multer
-//
-// Campos que manda el front: nombre, email, telefono, checkin, checkout, huespedes, mensaje.
-// Se monta en index.js DESPUÉS de express.json().
-//
-// Variables de entorno:
-//   BREVO_API_KEY    clave de la API de Brevo
-//   EMAIL_FROM       remitente verificado en Brevo (ej. reservas@quintadeargos.com)
-//   EMAIL_FROM_NAME  opcional, por defecto "Quinta de Argos"
-//   EMAIL_CONTACTO   buzón que recibe las consultas (por defecto quintadeargos@gmail.com)
-//   FRONT_END        URL pública de la web (logo y enlaces de los correos)
-
 const express = require("express");
 const { BrevoClient } = require("@getbrevo/brevo");
 const mongoose = require("mongoose");
@@ -462,7 +440,7 @@ function emailAcuseHuesped(c) {
         ${parrafo("Si prefieres, también puedes consultar la disponibilidad y reservar directamente en nuestra web, o escribirnos por WhatsApp.")}
 
         <div style="margin:0 0 20px;">
-            ${boton(`${EMPRESA.web}/reservas`, "Ver disponibilidad")}
+            ${boton(`${EMPRESA.web}/reservations`, "Ver disponibilidad")}
             ${boton(EMPRESA.whatsappUrl, "Escribir por WhatsApp", { secundario: true })}
         </div>
     `;
@@ -477,7 +455,7 @@ function emailAcuseHuesped(c) {
         e.noches ? `Duración: ${e.noches}` : null,
         `Huéspedes: ${e.huespedes}`,
         "",
-        `Reserva online: ${EMPRESA.web}/reservas`,
+        `Reserva online: ${EMPRESA.web}/reservations`,
         `WhatsApp: ${EMPRESA.whatsappTexto}`,
         "",
         EMPRESA.nombre,
@@ -942,7 +920,7 @@ const facturaEnCurso = new Set();
 const quienEnvia = (req) => req.freshAdmin?.email || req.user?.email || "admin";
 
 contactRouter.post(
-    "/api/admin/reservas-web/:id/factura-adjunta",
+    "/api/admin/reservations-web/:id/factura-adjunta",
     adminMiddleware,
     requireFreshAdmin,
     recibirFactura, // primero el archivo: así req.body.pin existe para la firma
