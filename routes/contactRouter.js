@@ -78,7 +78,7 @@ const EMPRESA = {
     whatsappUrl: "https://wa.me/34633491825",
     web: WEB_URL,
     webTexto: WEB_URL.replace(/^https?:\/\//, ""),
-    logoUrl: `${WEB_URL}/Isologo_Icon.png`,
+    logoUrl: `https://res.cloudinary.com/dhqzn8gwi/image/upload/v1791837243/sboz3aawcb2nfqvyviyl.jpg`,
 };
 
 // ---------- Paleta de la marca ----------
