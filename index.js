@@ -14,6 +14,7 @@ const paymentsRouter = require("./routes/paymentsRouter")
 const reservasRouter = require("./routes/reservasRouter")
 const adminReservasWebRouter = require("./routes/adminReservasWebRouter")
 const adminGestionReservasRouter = require("./routes/adminGestionReservasRouter")
+const sesHospedajesRouter = require("./routes/sesHospedajesRouter")
 const { startBeds24TarifasJob } = require("./data/tarifas")
 
 const app = express()
@@ -47,6 +48,7 @@ app.use(adminChannelsRouter)
 app.use(reservasRouter)
 app.use(adminReservasWebRouter)
 app.use(adminGestionReservasRouter)
+app.use(sesHospedajesRouter)
 
 app.use((req,res) => {
     res.send(`<h1>404 - Not Found</h1>`)
