@@ -20,6 +20,8 @@
 
 const express = require("express");
 const https = require("https");
+const http = require("http");
+const crypto = require("crypto");
 const tls = require("tls");
 const zlib = require("zlib");
 const adminMiddleware = require("../middleware/adminMiddleware");
@@ -62,16 +64,98 @@ function sesConfig() {
     };
 }
 
-// Si el Ministerio no manda la cadena completa, se puede añadir su certificado intermedio en SES_CA_PEM
+// ---------- Certificados ----------
+// El servidor del Ministerio no envía su certificado intermedio (error UNABLE_TO_VERIFY_LEAF_SIGNATURE).
+// Se descarga una sola vez de la dirección que indica su propio certificado (AIA "CA Issuers"),
+// como hacen los navegadores, y se añade a los de confianza. La cadena se sigue verificando
+// contra las autoridades raíz de Node: no se desactiva ninguna comprobación.
+// Opcional: SES_CA_PEM con el intermedio en PEM, por si la descarga automática fallara.
+const TLS_CHAIN_ERRORS = new Set([
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+    "UNABLE_TO_GET_ISSUER_CERT",
+]);
+const extraCAs = new Set();
 let httpsAgent = null;
+
 function getAgent() {
     if (httpsAgent) return httpsAgent;
-    const extra = process.env.SES_CA_PEM ? process.env.SES_CA_PEM.replace(/\\n/g, "\n") : null;
+    const list = [...extraCAs];
+    if (process.env.SES_CA_PEM) list.push(process.env.SES_CA_PEM.replace(/\\n/g, "\n"));
     httpsAgent = new https.Agent({
         keepAlive: false,
-        ca: extra ? [...tls.rootCertificates, extra] : undefined,
+        ca: list.length ? [...tls.rootCertificates, ...list] : undefined,
     });
     return httpsAgent;
+}
+
+function downloadBuffer(url, redirects = 2) {
+    return new Promise((resolve, reject) => {
+        const client = url.startsWith("https:") ? https : http;
+        const req = client.get(url, { timeout: 15000 }, (res) => {
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
+                res.resume();
+                return resolve(downloadBuffer(new URL(res.headers.location, url).toString(), redirects - 1));
+            }
+            if (res.statusCode !== 200) {
+                res.resume();
+                return reject(new Error(`descarga del certificado intermedio: estado ${res.statusCode}`));
+            }
+            const chunks = [];
+            let size = 0;
+            res.on("data", (chunk) => {
+                size += chunk.length;
+                if (size > 200 * 1024) req.destroy(new Error("certificado intermedio demasiado grande"));
+                else chunks.push(chunk);
+            });
+            res.on("end", () => resolve(Buffer.concat(chunks)));
+        });
+        req.on("timeout", () => req.destroy(new Error("descarga del certificado intermedio: tiempo agotado")));
+        req.on("error", reject);
+    });
+}
+
+function peerCertificate(host, port) {
+    return new Promise((resolve, reject) => {
+        // Solo se lee el certificado para saber de dónde bajar el intermedio; no se envía nada
+        const socket = tls.connect({ host, port, servername: host, rejectUnauthorized: false, timeout: 15000 }, () => {
+            const cert = socket.getPeerCertificate(true);
+            socket.end();
+            resolve(cert);
+        });
+        socket.on("timeout", () => socket.destroy(new Error("tiempo agotado leyendo el certificado")));
+        socket.on("error", reject);
+    });
+}
+
+let learning = null;
+function learnIntermediate(url) {
+    if (learning) return learning;
+    learning = (async () => {
+        const { hostname, port } = new URL(url);
+        const cert = await peerCertificate(hostname, Number(port) || 443);
+        const uris = (cert?.infoAccess?.["CA Issuers - URI"] || []).filter((u) => /^https?:\/\//.test(u));
+        if (!uris.length) throw new Error("el certificado del Ministerio no indica dónde descargar su intermedio");
+
+        let lastError = null;
+        for (const uri of uris) {
+            try {
+                const buf = await downloadBuffer(uri);
+                const text = buf.toString("latin1");
+                const pem = text.includes("-----BEGIN CERTIFICATE-----")
+                    ? text
+                    : new crypto.X509Certificate(buf).toString();
+                extraCAs.add(pem);
+                httpsAgent = null;
+                console.log(`SES: certificado intermedio del Ministerio añadido (${new crypto.X509Certificate(pem).subject.split("\n").find((l) => l.startsWith("CN=")) || uri}) 🟢`);
+                return true;
+            } catch (err) {
+                lastError = err;
+            }
+        }
+        throw lastError || new Error("no se pudo descargar el certificado intermedio");
+    })().finally(() => { learning = null; });
+    return learning;
 }
 
 // ==========================================================
@@ -522,7 +606,23 @@ class SesError extends Error {
     }
 }
 
-function sesRequest(cfg, body) {
+// Hace la petición; si falla la cadena TLS, aprende el intermedio y reintenta una vez
+async function sesRequest(cfg, body) {
+    try {
+        return await sesRequestOnce(cfg, body);
+    } catch (error) {
+        if (!TLS_CHAIN_ERRORS.has(error.tlsCode)) throw error;
+        try {
+            await learnIntermediate(cfg.url);
+        } catch (learnError) {
+            logError("SES: no se pudo obtener el certificado intermedio", learnError);
+            throw new SesError(`No se pudo verificar el certificado del Ministerio (${error.tlsCode}). Añade su certificado intermedio en SES_CA_PEM.`, 502);
+        }
+        return sesRequestOnce(cfg, body);
+    }
+}
+
+function sesRequestOnce(cfg, body) {
     const payload = soapEnvelope(body);
     const auth = Buffer.from(`${cfg.usuario}:${cfg.password}`).toString("base64");
 
@@ -548,15 +648,25 @@ function sesRequest(cfg, body) {
                 const fault = getTag(text, "faultstring");
                 if (fault) return reject(new SesError(`El Ministerio devolvió un error: ${fault}`, 502));
                 if (res.statusCode >= 400) {
-                    return reject(new SesError(`El Ministerio respondió con el estado ${res.statusCode}`, 502));
+                    // Extracto legible de la respuesta (HTML o texto) para saber qué devolvió
+                    const extracto = text.replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ")
+                        .replace(/\s+/g, " ").trim().slice(0, 200);
+                    if (!esProduccion) console.warn(`SES: respuesta ${res.statusCode} de ${cfg.url}: ${text.slice(0, 1500)}`);
+                    return reject(new SesError(
+                        `El Ministerio respondió con el estado ${res.statusCode}${res.statusCode >= 500 ? " (su servidor no está disponible en este momento)" : ""}${extracto ? `: ${extracto}` : ""}`,
+                        502
+                    ));
                 }
                 resolve(text);
             });
         });
         req.on("timeout", () => req.destroy(new SesError("El Ministerio no respondió a tiempo", 504)));
-        req.on("error", (err) => reject(err instanceof SesError
-            ? err
-            : new SesError(`No se pudo conectar con el Ministerio (${err.code || err.message})`, 502)));
+        req.on("error", (err) => {
+            if (err instanceof SesError) return reject(err);
+            const wrapped = new SesError(`No se pudo conectar con el Ministerio (${err.code || err.message})`, 502);
+            wrapped.tlsCode = err.code;
+            reject(wrapped);
+        });
         req.end(payload);
     });
 }
@@ -693,6 +803,41 @@ sesHospedajesRouter.get("/api/admin/ses/estado", adminMiddleware, (req, res) => 
         entorno: cfg.entorno,
         establecimiento: cfg.establecimiento || null,
     });
+});
+
+// Probar conexión y credenciales sin comunicar nada: consulta un lote inexistente
+sesHospedajesRouter.post("/api/admin/ses/probar", adminMiddleware, async (req, res) => {
+    const cfg = sesConfig();
+    if (cfg.faltan.length) {
+        return res.status(503).json({ message: `Falta configurar el servicio web: ${cfg.faltan.join(", ")}` });
+    }
+    try {
+        const text = await sesRequest(cfg, consultaLoteBody([crypto.randomUUID()]));
+        const respuesta = getAll(text, "respuesta")[0] || "";
+        const codigo = getTag(respuesta, "codigo");
+        const descripcion = getTag(respuesta, "descripcion");
+        res.json({
+            ok: true,
+            entorno: cfg.entorno,
+            message: `Conexión correcta con el entorno de ${cfg.entorno}: el Ministerio aceptó las credenciales`
+                + (codigo !== null ? ` (respuesta ${codigo}${descripcion ? `: ${descripcion}` : ""}).` : "."),
+        });
+    } catch (error) {
+        // Un error SOAP significa que se llegó al servicio y la autenticación pasó
+        if (error instanceof SesError && error.message.startsWith("El Ministerio devolvió un error")) {
+            return res.json({
+                ok: true,
+                entorno: cfg.entorno,
+                message: `Conexión y credenciales correctas (${cfg.entorno}). El servicio respondió: ${error.message.replace("El Ministerio devolvió un error: ", "")}`,
+            });
+        }
+        logError("SES: prueba de conexión fallida", error);
+        res.status(error.status || 502).json({
+            ok: false,
+            entorno: cfg.entorno,
+            message: error instanceof SesError ? error.message : "No se ha podido probar la conexión",
+        });
+    }
 });
 
 // Reservas que necesitan parte: llegadas de los últimos 30 días y los próximos 60
