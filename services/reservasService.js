@@ -14,6 +14,7 @@ const {
     MAX_NOCHES,
     MAX_HUESPEDES,
     ZONA_HORARIA,
+    DESCUENTO_WEB,
     ADICIONALES,
 } = require("../config/reservasConfig");
 
@@ -74,9 +75,59 @@ function limitesReserva(ahora = new Date()) {
     };
 }
 
-// ---------- Tarifas ----------
+// ---------- Precios de la web ----------
+// Las reglas (data/tarifas.js) dan el precio de Beds24, Booking y Airbnb.
+// La web cobra:
+//   1) el precio fijado a mano para esa noche (panel → Configuración → Precios de la web), o
+//   2) el precio de las reglas con el descuento general, redondeado al euro.
+// El relleno diario de Beds24 no pasa por aquí: sigue usando el precio completo.
+//
+// Los precios a mano y el descuento viven en Mongo (models/PrecioWeb.js) y se guardan
+// en memoria para que tarifaDe() siga siendo síncrona. Se recargan cada minuto, al
+// guardar desde el panel y justo antes de cobrar (paymentsRouter → cargarPreciosWeb).
+
+const preciosWeb = {
+    manuales: new Map(), // fecha -> precio
+    descuento: DESCUENTO_WEB,
+    cargadoEn: 0,
+};
+
+async function cargarPreciosWeb() {
+    try {
+        const { PrecioWeb, AjustesWeb } = require("../models/PrecioWeb");
+        const [filas, ajustes] = await Promise.all([
+            PrecioWeb.find({}, { fecha: 1, precio: 1, _id: 0 }).lean(),
+            AjustesWeb.findById("web").lean(),
+        ]);
+        preciosWeb.manuales = new Map(filas.map((f) => [f.fecha, f.precio]));
+        preciosWeb.descuento = typeof ajustes?.descuento === "number" ? ajustes.descuento : DESCUENTO_WEB;
+        preciosWeb.cargadoEn = Date.now();
+    } catch (error) {
+        // Si Mongo falla se siguen usando los últimos precios cargados.
+        console.error("Precios web: no se pudieron cargar 🟠", error?.message || error);
+    }
+    return preciosWeb;
+}
+
+const RECARGA_MS = 60 * 1000;
+setTimeout(cargarPreciosWeb, 0).unref?.();
+setInterval(cargarPreciosWeb, RECARGA_MS).unref?.();
+
+const descuentoWeb = () => preciosWeb.descuento;
+
+/** Precio web automático (reglas con el descuento general) a partir del precio de las reglas. */
+const precioWebAutomatico = (precioReglas, descuento = preciosWeb.descuento) => Math.round(precioReglas * (1 - descuento));
+
 function tarifaDe(fecha) {
-    return tarifaSegunReglas(fecha);
+    const tarifa = tarifaSegunReglas(fecha);
+    if (!tarifa) return null;
+    const manual = preciosWeb.manuales.get(fecha);
+    return {
+        precio: manual ?? precioWebAutomatico(tarifa.precio),
+        precioSinDescuento: tarifa.precio,
+        minNoches: tarifa.minNoches,
+        manual: manual !== undefined,
+    };
 }
 
 // ---------- Calendario público ----------
@@ -98,7 +149,12 @@ function construirCalendario(ocupadas, ahora = new Date()) {
             dias[fecha] = { estado: "sin_tarifa" };
             continue;
         }
-        dias[fecha] = { estado: "libre", precio: tarifa.precio, minNoches: tarifa.minNoches };
+        dias[fecha] = {
+            estado: "libre",
+            precio: tarifa.precio,
+            precioSinDescuento: tarifa.precioSinDescuento,
+            minNoches: tarifa.minNoches,
+        };
     }
 
     return { hoy, primeraLlegada, ultimaNoche, dias };
@@ -181,9 +237,11 @@ function cotizarReserva(datos, ocupadas, ahora = new Date()) {
         return { id: a.id, nombre: a.nombre, precio: a.precio };
     });
 
-    const alojamiento = desglose.reduce((s, n) => s + n.precio, 0);
+    // Sumas en céntimos para que no aparezcan decimales raros (374.29999…).
+    const alojamientoCentimos = desglose.reduce((s, n) => s + Math.round(n.precio * 100), 0);
+    const alojamiento = alojamientoCentimos / 100;
     const totalAdicionales = adicionales.reduce((s, a) => s + a.precio, 0);
-    const total = alojamiento + totalAdicionales;
+    const total = (alojamientoCentimos + Math.round(totalAdicionales * 100)) / 100;
 
     return {
         checkIn,
@@ -207,6 +265,10 @@ module.exports = {
     hoyEnEspana,
     limitesReserva,
     tarifaDe,
+    tarifaSegunReglas,
+    cargarPreciosWeb,
+    descuentoWeb,
+    precioWebAutomatico,
     construirCalendario,
     cotizarReserva,
 };

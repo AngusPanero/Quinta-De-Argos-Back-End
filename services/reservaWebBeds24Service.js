@@ -5,12 +5,19 @@
 //
 // Todo es idempotente: si el webhook de Stripe llega dos veces o se reintenta
 // una cancelación a medias, no se duplica nada.
+//
+// sincronizarReservaWeb además toma un bloqueo atómico en Mongo: si el mismo pago
+// llega a la vez a dos procesos (por ejemplo, el back local con `stripe listen` y
+// el de Render con el endpoint del Dashboard), solo uno crea la reserva en Beds24.
+// Sin esto, el segundo veía las noches ocupadas por la reserva que acababa de crear
+// el primero, lo tomaba por un conflicto y reembolsaba al huésped.
 
 const { stripe } = require("../config/stripe");
 const { getNochesOcupadas, invalidarCacheDisponibilidad } = require("./beds24AvailabilityService");
 const {
     crearReservaBeds24,
     cancelarReservaBeds24,
+    liberarSiSigueActiva,
     buscarPorReferencia,
     invalidarCachesPanel,
 } = require("./beds24BookingsService");
@@ -71,8 +78,36 @@ function datosParaBeds24(reserva, { prueba }) {
     };
 }
 
+const BLOQUEO_MS = 2 * 60 * 1000; // si un proceso muere con el bloqueo puesto, caduca solo
+
+// Marca la reserva como "creándose en Beds24" de forma atómica.
+// Devuelve true solo al proceso que consigue el bloqueo.
+// (strict: false porque beds24.bloqueadoHasta no está en el schema: no hace falta tocar el modelo)
+async function tomarBloqueo(reserva) {
+    const Modelo = reserva.constructor;
+    const ahora = new Date();
+    const r = await Modelo.updateOne(
+        {
+            _id: reserva._id,
+            estado: "pagada",
+            "beds24.bookingId": null,
+            $or: [{ "beds24.bloqueadoHasta": null }, { "beds24.bloqueadoHasta": { $lt: ahora } }],
+        },
+        { $set: { "beds24.bloqueadoHasta": new Date(ahora.getTime() + BLOQUEO_MS) } },
+        { strict: false }
+    );
+    return r.modifiedCount === 1;
+}
+
+async function soltarBloqueo(reserva) {
+    await reserva.constructor
+        .updateOne({ _id: reserva._id }, { $unset: { "beds24.bloqueadoHasta": "" } }, { strict: false })
+        .catch(() => {});
+}
+
 // Alguien reservó esas noches (Booking, Airbnb...) mientras este huésped pagaba:
 // no se puede alojar a los dos, así que se le devuelve todo automáticamente.
+// Solo se llama si la reserva NO existe en Beds24 (comprobado justo antes).
 async function reembolsarPorConflicto(reserva, nochesOcupadas) {
     const yaDevuelto = reserva.cancelacion?.reembolsoCentimos || 0;
     const importe = reserva.importes.totalCentimos - yaDevuelto;
@@ -98,7 +133,8 @@ async function reembolsarPorConflicto(reserva, nochesOcupadas) {
         por: "sistema",
         reembolsoCentimos: yaDevuelto + importe,
         refundIds: [...(reserva.cancelacion?.refundIds || []), ...(refundId ? [refundId] : [])],
-        beds24Cancelada: true, // nunca llegó a existir en Beds24
+        // true solo si de verdad no existe en Beds24; si tuviera id, se cancelaría desde el panel.
+        beds24Cancelada: !reserva.beds24?.bookingId,
     };
     reserva.beds24.error = motivo.slice(0, 300);
     reserva.cambiarEstado("reembolsada", motivo.slice(0, 300));
@@ -116,6 +152,15 @@ async function reembolsarPorConflicto(reserva, nochesOcupadas) {
 async function sincronizarReservaWeb(reserva, { prueba = false } = {}) {
     if (reserva.beds24?.bookingId) return { estado: "ya_sincronizada", bookingId: reserva.beds24.bookingId };
     if (reserva.estado !== "pagada") return { estado: "no_aplica" };
+
+    // Solo un proceso a la vez por reserva.
+    if (!(await tomarBloqueo(reserva))) {
+        const actual = await reserva.constructor.findById(reserva._id).lean();
+        if (actual?.beds24?.bookingId) return { estado: "ya_sincronizada", bookingId: actual.beds24.bookingId };
+        // Otro proceso la está creando ahora mismo: él manda la confirmación.
+        console.log(`⏳ Reserva ${reserva.codigo}: otro proceso la está pasando a Beds24, no se duplica`);
+        return { estado: "en_curso" };
+    }
 
     const { checkIn, checkOut } = reserva.estancia;
     reserva.beds24.intentos = (reserva.beds24.intentos || 0) + 1;
@@ -135,6 +180,15 @@ async function sincronizarReservaWeb(reserva, { prueba = false } = {}) {
         const ocupadas = await getNochesOcupadas(checkIn, sumarDias(checkOut, -1), { fresco: true });
         const choque = nochesDe(checkIn, checkOut).filter((n) => ocupadas.has(n));
         if (choque.length) {
+            // Última comprobación: que la "otra reserva" no sea la nuestra.
+            const nuestra = await buscarPorReferencia(reserva.codigo, checkIn);
+            if (nuestra) {
+                reserva.beds24.bookingId = String(nuestra.id);
+                reserva.beds24.sincronizadoEn = new Date();
+                reserva.beds24.error = "";
+                await reserva.save();
+                return { estado: "ya_existia", bookingId: reserva.beds24.bookingId };
+            }
             await reembolsarPorConflicto(reserva, choque);
             return { estado: "conflicto" };
         }
@@ -154,6 +208,8 @@ async function sincronizarReservaWeb(reserva, { prueba = false } = {}) {
         reserva.beds24.error = String(error.message || error).slice(0, 300);
         await reserva.save().catch(() => {});
         throw error;
+    } finally {
+        await soltarBloqueo(reserva);
     }
 }
 
@@ -192,6 +248,23 @@ async function cancelarReservaWeb(reserva, { reembolso, importeCentimos, motivo 
         importe = importeCentimos;
     }
     if (yaCancelada && importe === 0) {
+        // En Mongo ya está cancelada, pero puede seguir activa en Beds24 (por ejemplo,
+        // un reembolso automático que no llegó a cancelarla allí). Se comprueba en Beds24
+        // y, si sigue ocupando fechas, se cancela: así el panel repara estos casos.
+        if (reserva.beds24?.bookingId && (await liberarSiSigueActiva(reserva.beds24.bookingId))) {
+            if (!reserva.cancelacion) reserva.cancelacion = {};
+            reserva.cancelacion.beds24Cancelada = true;
+            reserva.beds24.error = "";
+            await reserva.save();
+            invalidarCacheDisponibilidad();
+            invalidarCachesPanel();
+            console.log(`🧹 Reserva ${reserva.codigo}: seguía activa en Beds24 (#${reserva.beds24.bookingId}) y se ha cancelado`);
+            return {
+                reembolsoCentimos: 0,
+                totalDevueltoCentimos: reserva.cancelacion.reembolsoCentimos || 0,
+                beds24Liberada: true,
+            };
+        }
         throw new CancelacionError("YA_CANCELADA", "Esta reserva ya está cancelada.", 409);
     }
 

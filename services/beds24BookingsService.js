@@ -48,6 +48,28 @@ async function cancelarReservaBeds24(bookingId) {
     primerResultado(data, "cancelar la reserva");
 }
 
+/**
+ * Estado REAL de una reserva en Beds24 (no el de nuestra copia en Mongo).
+ * @returns {Promise<string|null>} "confirmed" | "new" | "cancelled" | ... o null si no existe
+ */
+async function estadoReservaBeds24(bookingId) {
+    const id = Number(bookingId);
+    const lista = await fetchBookings({ id });
+    const booking = (lista || []).find((b) => Number(b.id) === id);
+    return booking ? String(booking.status) : null;
+}
+
+/**
+ * Si la reserva sigue ocupando fechas en Beds24, la cancela allí.
+ * @returns {Promise<boolean>} true si estaba activa y se ha cancelado ahora
+ */
+async function liberarSiSigueActiva(bookingId) {
+    const estado = await estadoReservaBeds24(bookingId);
+    if (!estado || !ESTADOS_QUE_OCUPAN.has(estado)) return false;
+    await cancelarReservaBeds24(bookingId);
+    return true;
+}
+
 /** Reservas activas que pisan alguna noche entre checkIn (incluida) y checkOut (excluida). */
 async function reservasQueSolapan(checkIn, checkOut) {
     // Filtro amplio en Beds24 y el exacto aquí, para no depender de cómo
@@ -123,6 +145,8 @@ module.exports = {
     Beds24WriteError,
     crearReservaBeds24,
     cancelarReservaBeds24,
+    estadoReservaBeds24,
+    liberarSiSigueActiva,
     reservasQueSolapan,
     buscarPorReferencia,
     nochesConCierre,

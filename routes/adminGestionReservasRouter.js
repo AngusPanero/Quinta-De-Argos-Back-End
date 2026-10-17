@@ -23,7 +23,7 @@ const Beds24Booking = require("../models/Beds24Booking");
 const { MAX_HUESPEDES } = require("../config/reservasConfig");
 const { hoyEnEspana } = require("../services/reservasService");
 const { invalidarCacheDisponibilidad } = require("../services/beds24AvailabilityService");
-const { cancelarReservaBeds24, invalidarCachesPanel } = require("../services/beds24BookingsService");
+const { cancelarReservaBeds24, liberarSiSigueActiva, invalidarCachesPanel } = require("../services/beds24BookingsService");
 const { sincronizarReservaWeb, cancelarReservaWeb, CancelacionError } = require("../services/reservaWebBeds24Service");
 const { planificarReservaManual, crearReservaManual, GestionError, leerEuros, MAX_NOCHES_MANUAL } = require("../services/reservaManualService");
 
@@ -242,10 +242,13 @@ router.post(
                 });
             }
             if (booking.status === "cancelled") {
-                return res.status(409).json({ message: "YA_CANCELADA", detail: "Esta reserva ya está cancelada." });
+                // Nuestra copia dice cancelada: se comprueba en Beds24 por si sigue activa allí.
+                if (!(await liberarSiSigueActiva(beds24Id))) {
+                    return res.status(409).json({ message: "YA_CANCELADA", detail: "Esta reserva ya está cancelada." });
+                }
+            } else {
+                await cancelarReservaBeds24(beds24Id);
             }
-
-            await cancelarReservaBeds24(beds24Id);
             await Beds24Booking.updateOne({ beds24Id }, { $set: { status: "cancelled", cancelTime: new Date() } });
             invalidarCacheDisponibilidad();
             invalidarCachesPanel();

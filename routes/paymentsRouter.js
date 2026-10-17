@@ -24,7 +24,7 @@ const express = require("express");
 const { stripe } = require("../config/stripe");
 const Reserva = require("../models/Reserva");
 const { getNochesOcupadas, invalidarCacheDisponibilidad, Beds24Error } = require("../services/beds24AvailabilityService");
-const { cotizarReserva, limitesReserva, ReservaError } = require("../services/reservasService");
+const { cotizarReserva, limitesReserva, cargarPreciosWeb, ReservaError } = require("../services/reservasService");
 const { validarDatosCliente } = require("../services/datosClienteService");
 const { sincronizarReservaWeb } = require("../services/reservaWebBeds24Service");
 const { notificarReserva } = require("./contactRouter");
@@ -200,6 +200,7 @@ paymentsRouter.post("/intent", express.json({ limit: "20kb" }), async (req, res)
         const { checkIn, checkOut, guests, adicionales } = req.body ?? {};
         const { hoy, ultimaNoche } = limitesReserva();
         const ocupadas = await getNochesOcupadas(hoy, ultimaNoche, { fresco: true });
+        await cargarPreciosWeb(); // precios de la web en fresco (los edita el panel)
         const presupuesto = cotizarReserva({ checkIn, checkOut, guests, adicionales }, ocupadas);
 
         // c) Guardamos la reserva ANTES de cobrar, con los consentimientos registrados.

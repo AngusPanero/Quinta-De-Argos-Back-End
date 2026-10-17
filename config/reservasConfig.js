@@ -22,6 +22,11 @@ const ZONA_HORARIA = "Europe/Madrid";
 
 const MONEDA = "eur";
 
+// Descuento por reservar directamente en la web, sobre el precio de cada noche
+// (el mismo que reciben Booking y Airbnb desde Beds24). 0.05 = 5 %.
+// Solo afecta al alojamiento de la web: no a los adicionales ni a Beds24.
+const DESCUENTO_WEB = 0.05;
+
 // Adicionales que se pueden contratar. ESTOS son los precios que se cobran.
 // Los ids tienen que coincidir con los de BookingConfig.ts del front
 // (allí solo se usan para mostrar nombre y descripción).
@@ -41,5 +46,6 @@ module.exports = {
     MAX_HUESPEDES,
     ZONA_HORARIA,
     MONEDA,
+    DESCUENTO_WEB,
     ADICIONALES,
 };
