@@ -142,6 +142,7 @@ function invalidarCachesPanel() {
 }
 
 module.exports = {
+    ESTADOS_QUE_OCUPAN,
     Beds24WriteError,
     crearReservaBeds24,
     cancelarReservaBeds24,

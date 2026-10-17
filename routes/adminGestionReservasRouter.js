@@ -1,4 +1,4 @@
-// routes/adminGestionReservasRouter.js — Quinta de Argos
+// routes/adminGestionReservasadminGestionReservasRouter.js — Quinta de Argos
 // Gestión de reservas desde el panel (Configuración → Calendario → Reservas particulares y uso propio).
 //
 //   GET  /api/admin/gestion-reservas                         -> próximas reservas que se pueden cancelar desde la web
@@ -23,11 +23,13 @@ const Beds24Booking = require("../models/Beds24Booking");
 const { MAX_HUESPEDES } = require("../config/reservasConfig");
 const { hoyEnEspana } = require("../services/reservasService");
 const { invalidarCacheDisponibilidad } = require("../services/beds24AvailabilityService");
-const { cancelarReservaBeds24, liberarSiSigueActiva, invalidarCachesPanel } = require("../services/beds24BookingsService");
+const {
+    cancelarReservaBeds24, liberarSiSigueActiva, estadoReservaBeds24, ESTADOS_QUE_OCUPAN, invalidarCachesPanel,
+} = require("../services/beds24BookingsService");
 const { sincronizarReservaWeb, cancelarReservaWeb, CancelacionError } = require("../services/reservaWebBeds24Service");
 const { planificarReservaManual, crearReservaManual, GestionError, leerEuros, MAX_NOCHES_MANUAL } = require("../services/reservaManualService");
 
-const router = express.Router();
+const adminGestionReservasRouter = express.Router();
 
 // La firma reutiliza la sección "calendario" (mismo bloqueo y auditoría que el resto del calendario).
 const SECCION_FIRMA = "calendario";
@@ -72,7 +74,7 @@ function centimosDeBody(body) {
 }
 
 // ---------- Listado ----------
-router.get("/api/admin/gestion-reservas", adminMiddleware, async (req, res) => {
+adminGestionReservasRouter.get("/api/admin/gestion-reservas", adminMiddleware, async (req, res) => {
     try {
         const hoy = hoyEnEspana();
         const bookings = await Beds24Booking.find({
@@ -147,7 +149,7 @@ router.get("/api/admin/gestion-reservas", adminMiddleware, async (req, res) => {
 });
 
 // ---------- Reserva particular / uso propio ----------
-router.post("/api/admin/gestion-reservas/preview", adminMiddleware, async (req, res) => {
+adminGestionReservasRouter.post("/api/admin/gestion-reservas/preview", adminMiddleware, async (req, res) => {
     try {
         const { datos, conflictos, cierres } = await planificarReservaManual(req.body);
         res.json({ datos, conflictos, cierres });
@@ -156,7 +158,7 @@ router.post("/api/admin/gestion-reservas/preview", adminMiddleware, async (req, 
     }
 });
 
-router.post(
+adminGestionReservasRouter.post(
     "/api/admin/gestion-reservas",
     adminMiddleware,
     requireFreshAdmin,
@@ -218,7 +220,7 @@ async function cancelarPorReservaWeb(req, res, reserva) {
     res.json({ cancelada: true, codigo: reserva.codigo, ...resultado });
 }
 
-router.post(
+adminGestionReservasRouter.post(
     "/api/admin/gestion-reservas/:beds24Id/cancelar",
     adminMiddleware,
     requireFreshAdmin,
@@ -249,6 +251,14 @@ router.post(
             } else {
                 await cancelarReservaBeds24(beds24Id);
             }
+            // Comprobación: que Beds24 la haya cancelado de verdad (no basta con su "OK").
+            const estado = await estadoReservaBeds24(beds24Id);
+            if (estado && ESTADOS_QUE_OCUPAN.has(estado)) {
+                return res.status(502).json({
+                    message: "BEDS24_NO_CANCELA",
+                    detail: `Beds24 respondió, pero la reserva #${beds24Id} sigue activa. Inténtalo de nuevo o cancélala en Beds24.`,
+                });
+            }
             await Beds24Booking.updateOne({ beds24Id }, { $set: { status: "cancelled", cancelTime: new Date() } });
             invalidarCacheDisponibilidad();
             invalidarCachesPanel();
@@ -272,7 +282,7 @@ router.post(
     })
 );
 
-router.post(
+adminGestionReservasRouter.post(
     "/api/admin/reservas-web/:id/cancelar",
     adminMiddleware,
     requireFreshAdmin,
@@ -297,7 +307,7 @@ router.post(
 );
 
 // ---------- Reintentar el paso a Beds24 de un pago web ----------
-router.post(
+adminGestionReservasRouter.post(
     "/api/admin/reservas-web/:id/beds24",
     adminMiddleware,
     requireFreshAdmin,
@@ -319,4 +329,4 @@ router.post(
     })
 );
 
-module.exports = router;
+module.exports = adminGestionReservasRouter;

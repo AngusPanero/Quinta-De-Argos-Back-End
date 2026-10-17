@@ -18,6 +18,8 @@ const {
     crearReservaBeds24,
     cancelarReservaBeds24,
     liberarSiSigueActiva,
+    estadoReservaBeds24,
+    ESTADOS_QUE_OCUPAN,
     buscarPorReferencia,
     invalidarCachesPanel,
 } = require("./beds24BookingsService");
@@ -214,6 +216,58 @@ async function sincronizarReservaWeb(reserva, { prueba = false } = {}) {
 }
 
 /**
+ * Cancela en Beds24 la reserva de este pago y COMPRUEBA que ya no ocupa fechas.
+ * No se fía solo del número guardado en Mongo: también busca en Beds24 la reserva
+ * con nuestra referencia (el código QA-…), por si el número guardado fuera de otra.
+ * Si al final sigue activa, lanza error: quien llama NO debe devolver el dinero.
+ * @returns {Promise<string[]>} números de Beds24 que se han cancelado ahora
+ */
+async function liberarEnBeds24(reserva) {
+    const { checkIn } = reserva.estancia;
+    const guardado = reserva.beds24?.bookingId ? String(reserva.beds24.bookingId) : null;
+    const canceladas = [];
+
+    // a) La reserva activa con nuestra referencia: es seguro que es la de este pago.
+    const propia = await buscarPorReferencia(reserva.codigo, checkIn);
+    if (propia) {
+        const id = String(propia.id);
+        if (guardado && guardado !== id) {
+            console.warn(`🟠 Reserva ${reserva.codigo}: el número guardado (#${guardado}) no coincide con el de Beds24 (#${id}). Se corrige.`);
+        }
+        reserva.beds24.bookingId = id;
+        await cancelarReservaBeds24(id);
+        canceladas.push(id);
+    }
+
+    // b) El número guardado, si es otro y sigue activo.
+    if (guardado && guardado !== (propia && String(propia.id)) && (await liberarSiSigueActiva(guardado))) {
+        canceladas.push(guardado);
+    }
+
+    // c) Comprobación final en Beds24 (no basta con que respondiera "OK").
+    const siguePropia = await buscarPorReferencia(reserva.codigo, checkIn);
+    const activas = siguePropia ? [String(siguePropia.id)] : [];
+    for (const id of new Set([guardado, reserva.beds24?.bookingId].filter(Boolean).map(String))) {
+        const estado = await estadoReservaBeds24(id);
+        if (estado && ESTADOS_QUE_OCUPAN.has(estado) && !activas.includes(id)) activas.push(id);
+    }
+    if (activas.length) {
+        throw new CancelacionError(
+            "BEDS24_NO_CANCELA",
+            `Beds24 no ha cancelado la reserva #${activas.join(", #")}. No se ha devuelto el dinero. Inténtalo de nuevo en unos minutos o cancélala en Beds24.`,
+            502
+        );
+    }
+
+    if (canceladas.length) {
+        invalidarCacheDisponibilidad();
+        invalidarCachesPanel();
+        console.log(`📅 Reserva ${reserva.codigo}: cancelada en Beds24 (#${canceladas.join(", #")})`);
+    }
+    return canceladas;
+}
+
+/**
  * Cancela una reserva web pagada: primero en Beds24 (libera las fechas) y luego
  * el reembolso en Stripe. Si se corta a mitad, se puede repetir sin duplicar nada.
  *
@@ -251,14 +305,13 @@ async function cancelarReservaWeb(reserva, { reembolso, importeCentimos, motivo 
         // En Mongo ya está cancelada, pero puede seguir activa en Beds24 (por ejemplo,
         // un reembolso automático que no llegó a cancelarla allí). Se comprueba en Beds24
         // y, si sigue ocupando fechas, se cancela: así el panel repara estos casos.
-        if (reserva.beds24?.bookingId && (await liberarSiSigueActiva(reserva.beds24.bookingId))) {
+        const liberadas = await liberarEnBeds24(reserva);
+        if (liberadas.length) {
             if (!reserva.cancelacion) reserva.cancelacion = {};
             reserva.cancelacion.beds24Cancelada = true;
             reserva.beds24.error = "";
             await reserva.save();
-            invalidarCacheDisponibilidad();
-            invalidarCachesPanel();
-            console.log(`🧹 Reserva ${reserva.codigo}: seguía activa en Beds24 (#${reserva.beds24.bookingId}) y se ha cancelado`);
+            console.log(`🧹 Reserva ${reserva.codigo}: seguía activa en Beds24 y se ha cancelado`);
             return {
                 reembolsoCentimos: 0,
                 totalDevueltoCentimos: reserva.cancelacion.reembolsoCentimos || 0,
@@ -276,16 +329,15 @@ async function cancelarReservaWeb(reserva, { reembolso, importeCentimos, motivo 
         reserva.cancelacion.por = por;
     }
 
-    // 1) Beds24: libera las fechas en todos los canales.
-    if (reserva.beds24?.bookingId && !reserva.cancelacion.beds24Cancelada) {
-        await cancelarReservaBeds24(reserva.beds24.bookingId);
+    // 1) Beds24: libera las fechas en todos los canales y COMPRUEBA que se liberaron.
+    //    Si Beds24 no la cancela, liberarEnBeds24 lanza error y NO se devuelve el dinero.
+    if (reserva.beds24?.bookingId || reserva.estado === "pagada") {
+        await liberarEnBeds24(reserva);
         reserva.cancelacion.beds24Cancelada = true;
         await reserva.save();
-        invalidarCacheDisponibilidad();
-        invalidarCachesPanel();
     }
 
-    // 2) Stripe: el reembolso (va a la misma tarjeta; tarda de 5 a 10 días en verse).
+    // 2) Stripe: el reembolso (solo si Beds24 ya está liberado) (va a la misma tarjeta; tarda de 5 a 10 días en verse).
     if (importe > 0) {
         const refund = await stripe.refunds.create(
             {
