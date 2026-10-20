@@ -16,6 +16,8 @@ const {
     ZONA_HORARIA,
     DESCUENTO_WEB,
     ADICIONALES,
+    // Fianza por persona en €. Si no está en config/reservasConfig.js, se usan 60 €.
+    FIANZA_POR_PERSONA = 60,
 } = require("../config/reservasConfig");
 
 class ReservaError extends Error {
@@ -160,15 +162,40 @@ function construirCalendario(ocupadas, ahora = new Date()) {
     return { hoy, primeraLlegada, ultimaNoche, dias };
 }
 
+// ---------- Huéspedes ----------
+// Acepta { adultos, menores, cuna } o, en llamadas antiguas, solo { guests }
+// (en ese caso todos cuentan como adultos y no hay cuna).
+function leerHuespedes(datos) {
+    const conDesglose = datos?.adultos !== undefined || datos?.menores !== undefined;
+    const adultos = conDesglose ? Number(datos.adultos) : Number(datos?.guests);
+    const menores = conDesglose ? Number(datos.menores ?? 0) : 0;
+
+    if (!Number.isInteger(adultos) || adultos < 1) {
+        throw new ReservaError("HUESPEDES_INVALIDOS", "Tiene que haber al menos una persona adulta (18 años o más).");
+    }
+    if (!Number.isInteger(menores) || menores < 0) {
+        throw new ReservaError("HUESPEDES_INVALIDOS", "El número de menores no es válido.");
+    }
+    const guests = adultos + menores;
+    if (guests > MAX_HUESPEDES) {
+        throw new ReservaError("HUESPEDES_INVALIDOS", `El número de huéspedes debe estar entre 1 y ${MAX_HUESPEDES}.`);
+    }
+
+    // La cuna solo tiene sentido si viaja algún menor. No cambia el precio.
+    const cuna = menores > 0 && (datos?.cuna === true || datos?.cuna === "true");
+    return { adultos, menores, guests, cuna };
+}
+
 // ---------- Presupuesto (fuente de verdad del precio) ----------
 /**
  * Valida una reserva y calcula su precio. Lanza ReservaError si algo no cuadra.
- * @param {{checkIn:string, checkOut:string, guests:number, adicionales?:string[]}} datos
+ * El total incluye la fianza (60 € por persona), que se devuelve al terminar la estancia
+ * si la casa no tiene daños.
+ * @param {{checkIn:string, checkOut:string, guests?:number, adultos?:number, menores?:number, cuna?:boolean, adicionales?:string[]}} datos
  * @param {Set<string>} ocupadas  noches ocupadas según Beds24
  */
 function cotizarReserva(datos, ocupadas, ahora = new Date()) {
     const { checkIn, checkOut } = datos ?? {};
-    const guests = Number(datos?.guests);
     const adicionalesPedidos = datos?.adicionales ?? [];
 
     if (!esFechaValida(checkIn) || !esFechaValida(checkOut)) {
@@ -194,9 +221,7 @@ function cotizarReserva(datos, ocupadas, ahora = new Date()) {
         throw new ReservaError("DEMASIADAS_NOCHES", `La estancia máxima es de ${MAX_NOCHES} noches.`);
     }
 
-    if (!Number.isInteger(guests) || guests < 1 || guests > MAX_HUESPEDES) {
-        throw new ReservaError("HUESPEDES_INVALIDOS", `El número de huéspedes debe estar entre 1 y ${MAX_HUESPEDES}.`);
-    }
+    const { adultos, menores, guests, cuna } = leerHuespedes(datos);
 
     const desglose = [];
     for (let fecha = checkIn; fecha < checkOut; fecha = sumarDias(fecha, 1)) {
@@ -241,20 +266,36 @@ function cotizarReserva(datos, ocupadas, ahora = new Date()) {
     const alojamientoCentimos = desglose.reduce((s, n) => s + Math.round(n.precio * 100), 0);
     const alojamiento = alojamientoCentimos / 100;
     const totalAdicionales = adicionales.reduce((s, a) => s + a.precio, 0);
-    const total = (alojamientoCentimos + Math.round(totalAdicionales * 100)) / 100;
+    const estanciaCentimos = alojamientoCentimos + Math.round(totalAdicionales * 100);
+
+    // Fianza: por persona (adultos y menores), se devuelve si la casa no tiene daños.
+    const fianzaCentimos = guests * Math.round(FIANZA_POR_PERSONA * 100);
+    const fianza = {
+        porPersona: FIANZA_POR_PERSONA,
+        personas: guests,
+        total: fianzaCentimos / 100,
+        totalCentimos: fianzaCentimos,
+    };
+
+    const totalCentimos = estanciaCentimos + fianzaCentimos;
 
     return {
         checkIn,
         checkOut,
         noches,
         guests,
+        adultos,
+        menores,
+        cuna,
         minNoches,
         desglose,
         alojamiento,
         adicionales,
         totalAdicionales,
-        total,
-        totalCentimos: Math.round(total * 100),
+        totalEstancia: estanciaCentimos / 100, // alojamiento + adicionales (sin fianza)
+        fianza,
+        total: totalCentimos / 100, // lo que se cobra: estancia + fianza
+        totalCentimos,
     };
 }
 
@@ -271,4 +312,5 @@ module.exports = {
     precioWebAutomatico,
     construirCalendario,
     cotizarReserva,
+    FIANZA_POR_PERSONA,
 };

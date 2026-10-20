@@ -2,6 +2,7 @@
 const express = require("express");
 const adminMiddleware = require("../middleware/adminMiddleware");
 const Beds24Booking = require("../models/Beds24Booking");
+const Reserva = require("../models/Reserva");
 const { syncUpcoming, getLastSync, getCalendar } = require("../services/bookingSync");
 const { isISODate, todayMadrid, nightsBetween } = require("../utils/dates");
 
@@ -14,6 +15,54 @@ const MAX_CALENDAR_DAYS = 120;
 
 const logError = (label, error) =>
     console.error(esProduccion ? `${label} 🔴` : `${label} 🔴 ${error}`);
+
+// ---------- Datos de la reserva web (huéspedes, cuna y fianza) ----------
+// Beds24 no guarda la fianza ni la cuna: se buscan en nuestra colección de
+// reservas web (Reserva) por el id de Beds24 y se adjuntan como `web`.
+// Las reservas que no son de la web llevan `web: null`.
+const CAMPOS_WEB = {
+    codigo: 1,
+    estado: 1,
+    "beds24.bookingId": 1,
+    "estancia.huespedes": 1,
+    "estancia.adultos": 1,
+    "estancia.menores": 1,
+    "estancia.cuna": 1,
+    "importes.total": 1,
+    "importes.totalCentimos": 1,
+    "importes.fianza": 1,
+    "devolucionFianza.centimos": 1,
+};
+
+function resumenWeb(r) {
+    const fianzaCentimos = r.importes?.fianza?.totalCentimos || 0;
+    const totalCentimos = r.importes?.totalCentimos || Math.round((r.importes?.total || 0) * 100);
+    return {
+        codigo: r.codigo,
+        estado: r.estado,
+        huespedes: r.estancia?.huespedes ?? 0,
+        adultos: typeof r.estancia?.adultos === "number" ? r.estancia.adultos : null, // null = reserva antigua
+        menores: r.estancia?.menores ?? 0,
+        cuna: Boolean(r.estancia?.cuna),
+        reserva: (totalCentimos - fianzaCentimos) / 100, // estancia (alojamiento + adicionales)
+        fianza: fianzaCentimos / 100,
+        fianzaPorPersona: r.importes?.fianza?.porPersona ?? 0,
+        fianzaPersonas: r.importes?.fianza?.personas ?? 0,
+        fianzaDevuelta: (r.devolucionFianza?.centimos || 0) / 100,
+        total: totalCentimos / 100, // lo cobrado: reserva + fianza
+    };
+}
+
+async function adjuntarDatosWeb(bookings) {
+    if (!bookings.length) return bookings;
+    const ids = bookings.map((b) => String(b.beds24Id));
+    const reservas = await Reserva.find({ "beds24.bookingId": { $in: ids } }, CAMPOS_WEB).lean();
+    const porId = new Map(reservas.map((r) => [String(r.beds24.bookingId), r]));
+    return bookings.map((b) => {
+        const r = porId.get(String(b.beds24Id));
+        return { ...b, web: r ? resumenWeb(r) : null };
+    });
+}
 
 // ---------- Listado de reservas ----------
 // GET /api/admin/reservas?scope=upcoming|past|cancelled&source=airbnb,booking
@@ -42,7 +91,8 @@ adminReservasRouter.get("/api/admin/reservas", adminMiddleware, async (req, res)
             if (list.length) filter.source = { $in: list };
         }
 
-        const bookings = await Beds24Booking.find(filter).sort(sort).limit(300).select("-__v").lean();
+        const lista = await Beds24Booking.find(filter).sort(sort).limit(300).select("-__v").lean();
+        const bookings = await adjuntarDatosWeb(lista);
         res.json({ bookings, today, lastSync: getLastSync() });
     } catch (error) {
         logError("Error listando reservas", error);
@@ -77,7 +127,8 @@ adminReservasRouter.get("/api/admin/reservas/:id", adminMiddleware, async (req, 
     try {
         const booking = await Beds24Booking.findOne({ beds24Id: id }).select("-__v").lean();
         if (!booking) return res.status(404).json({ message: "Reserva no encontrada" });
-        res.json({ booking });
+        const [conWeb] = await adjuntarDatosWeb([booking]);
+        res.json({ booking: conWeb });
     } catch (error) {
         logError("Error leyendo reserva", error);
         res.status(500).json({ message: "No se pudo cargar la reserva" });
@@ -95,7 +146,7 @@ adminReservasRouter.get("/api/admin/calendario", adminMiddleware, async (req, re
         return res.status(400).json({ message: `El rango máximo es de ${MAX_CALENDAR_DAYS} días` });
     }
     try {
-        const [days, bookings] = await Promise.all([
+        const [days, lista] = await Promise.all([
             getCalendar(from, to),
             Beds24Booking.find({
                 deletedInBeds24: false,
@@ -107,6 +158,8 @@ adminReservasRouter.get("/api/admin/calendario", adminMiddleware, async (req, re
                 .select("beds24Id status source arrival departure nights numAdult numChild firstName lastName price commission apiReference")
                 .lean(),
         ]);
+        // Mismos datos web que el listado (huéspedes, cuna, reserva, fianza y total).
+        const bookings = await adjuntarDatosWeb(lista);
         res.json({ days, bookings, lastSync: getLastSync() });
     } catch (error) {
         logError("Error cargando calendario", error);

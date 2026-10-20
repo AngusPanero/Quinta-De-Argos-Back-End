@@ -2,6 +2,9 @@
 // Reservas pagadas en la web:
 //   sincronizarReservaWeb  -> crea la reserva en Beds24 (la llama el webhook de Stripe)
 //   cancelarReservaWeb     -> la cancela en Beds24 y devuelve el dinero (total, parcial o nada)
+//   devolverFianza         -> devuelve la fianza (toda o una parte) al terminar la estancia
+//   reembolsarStripe       -> devuelve un importe repartiéndolo entre los pagos de la reserva
+//                             (el original y los de ampliaciones con link de Stripe)
 //
 // Todo es idempotente: si el webhook de Stripe llega dos veces o se reintenta
 // una cancelación a medias, no se duplica nada.
@@ -11,6 +14,16 @@
 // el de Render con el endpoint del Dashboard), solo uno crea la reserva en Beds24.
 // Sin esto, el segundo veía las noches ocupadas por la reserva que acababa de crear
 // el primero, lo tomaba por un conflicto y reembolsaba al huésped.
+//
+// IMPORTES:
+//   importes.totalCentimos   valor ACTUAL de la estancia con la fianza (cambia con las modificaciones)
+//   cobrado por Stripe       pago.importeCentimos (pago original) + pagosExtra de Stripe
+//   devuelto por Stripe      cancelación + fianza devuelta + reembolsos de modificaciones
+//   Lo que se puede devolver por Stripe = cobrado - devuelto. Lo pagado por transferencia
+//   lo gestiona el propietario aparte.
+//
+// FIANZA: a Beds24 se manda solo el precio de la estancia (sin fianza), para que
+// Booking/Airbnb y los informes de Beds24 no vean un importe inflado.
 
 const { stripe } = require("../config/stripe");
 const { getNochesOcupadas, invalidarCacheDisponibilidad } = require("./beds24AvailabilityService");
@@ -25,8 +38,8 @@ const {
 } = require("./beds24BookingsService");
 const { sumarDias } = require("./reservasService");
 
-// Tiene que coincidir con WEB_REFERER de services/bookingSync.js:
-// así el panel muestra estas reservas como "Web".
+// Beds24 guarda las reservas por API con referer "API": el panel las reconoce
+// como "Web" cruzando beds24Id con reserva.beds24.bookingId (services/bookingSync.js).
 const WEB_REFERER = "quintadeargos.com";
 
 class CancelacionError extends Error {
@@ -52,12 +65,100 @@ function nochesDe(checkIn, checkOut) {
 
 const euros = (centimos) => (centimos / 100).toLocaleString("es-ES", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 
+// ---------- Fianza y estancia ----------
+const fianzaCentimosDe = (reserva) => reserva.importes?.fianza?.totalCentimos || 0;
+const fianzaDevueltaDe = (reserva) => reserva.devolucionFianza?.centimos || 0;
+const estanciaCentimosDe = (reserva) => (reserva.importes?.totalCentimos || 0) - fianzaCentimosDe(reserva);
+
+// ---------- Dinero cobrado y devuelto por Stripe ----------
+
+/** Lo cobrado en el pago original (en reservas antiguas, el total de la reserva). */
+const pagoOriginalDe = (reserva) =>
+    typeof reserva.pago?.importeCentimos === "number" ? reserva.pago.importeCentimos : reserva.importes?.totalCentimos || 0;
+
+const pagosExtraStripe = (reserva) =>
+    (reserva.pagosExtra || []).filter((p) => p.metodo === "stripe" && p.paymentIntentId);
+
+function cobradoStripeDe(reserva) {
+    return pagoOriginalDe(reserva) + pagosExtraStripe(reserva).reduce((s, p) => s + (p.centimos || 0), 0);
+}
+
+function devueltoStripeDe(reserva) {
+    const porModificaciones = (reserva.modificaciones || []).reduce((s, m) => s + (m.reembolsoCentimos || 0), 0);
+    return (reserva.cancelacion?.reembolsoCentimos || 0) + fianzaDevueltaDe(reserva) + porModificaciones;
+}
+
+/** Lo que todavía se puede devolver por Stripe. */
+const maximoStripeDe = (reserva) => Math.max(cobradoStripeDe(reserva) - devueltoStripeDe(reserva), 0);
+
+/** Pagos de Stripe de la reserva, el original primero. */
+function paymentIntentsDe(reserva) {
+    return [reserva.pago?.paymentIntentId, ...pagosExtraStripe(reserva).map((p) => p.paymentIntentId)].filter(Boolean);
+}
+
+/**
+ * Devuelve `importe` céntimos repartiéndolo entre los pagos de Stripe de la reserva
+ * (primero el original, después las ampliaciones). Comprueba antes que haya saldo
+ * suficiente en Stripe, para no dejar un reembolso a medias.
+ * @returns {Promise<string[]>} ids de los reembolsos creados (re_...)
+ */
+async function reembolsarStripe(reserva, importe, { motivo = "", clave }) {
+    if (!Number.isInteger(importe) || importe <= 0) return [];
+
+    // 1) Cuánto queda por devolver en cada pago, según Stripe
+    const disponibles = [];
+    for (const pi of paymentIntentsDe(reserva)) {
+        const intent = await stripe.paymentIntents.retrieve(pi, { expand: ["latest_charge"] });
+        const charge = intent.latest_charge && typeof intent.latest_charge === "object" ? intent.latest_charge : null;
+        const disponible = charge ? charge.amount - (charge.amount_refunded || 0) : 0;
+        if (disponible > 0) disponibles.push({ pi, disponible });
+    }
+    const totalDisponible = disponibles.reduce((s, d) => s + d.disponible, 0);
+    if (totalDisponible < importe) {
+        throw new CancelacionError(
+            "STRIPE_SIN_SALDO",
+            `En Stripe solo quedan ${euros(totalDisponible)} € por devolver de esta reserva. Lo pagado por transferencia se devuelve por transferencia.`,
+            409
+        );
+    }
+
+    // 2) Reembolsos
+    const ids = [];
+    let restante = importe;
+    for (const { pi, disponible } of disponibles) {
+        if (restante <= 0) break;
+        const parte = Math.min(disponible, restante);
+        const refund = await stripe.refunds.create(
+            {
+                payment_intent: pi,
+                amount: parte,
+                reason: "requested_by_customer",
+                metadata: { reservaId: String(reserva._id), codigo: reserva.codigo, motivo },
+            },
+            // misma petición repetida = mismo reembolso, nunca dos
+            { idempotencyKey: `${clave}-${pi}-${parte}` }
+        );
+        ids.push(refund.id);
+        restante -= parte;
+    }
+    return ids;
+}
+
 function datosParaBeds24(reserva, { prueba }) {
     const { firstName, lastName } = separarNombre(reserva.contacto.nombre);
+    const e = reserva.estancia;
+    const adultos = typeof e.adultos === "number" && e.adultos > 0 ? e.adultos : e.huespedes;
+    const menores = typeof e.adultos === "number" && e.adultos > 0 ? e.menores || 0 : 0;
+    const fianza = fianzaCentimosDe(reserva);
+    const precioEstancia = estanciaCentimosDe(reserva) / 100;
+
     const adicionales = reserva.importes.adicionales.map((a) => `${a.nombre} (${a.precio} €)`).join(", ");
     const notas = [
         prueba ? "[PRUEBA] Pago en modo test de Stripe: cancela esta reserva cuando termines de probar." : null,
-        `Reserva web ${reserva.codigo}. Pagada con Stripe: ${reserva.importes.total} € (${reserva.pago.paymentIntentId}).`,
+        `Reserva web ${reserva.codigo}. Pagado con Stripe: ${reserva.importes.total} € (${reserva.pago.paymentIntentId}).`,
+        fianza ? `Incluye fianza reembolsable de ${euros(fianza)} €: devolver desde el panel de la web al terminar la estancia si no hay daños.` : null,
+        `Huéspedes: ${adultos} ${adultos === 1 ? "adulto" : "adultos"}${menores ? `, ${menores} ${menores === 1 ? "menor" : "menores"}` : ""}.`,
+        e.cuna ? "Necesitan CUNA para bebé (gratuita)." : null,
         adicionales ? `Adicionales: ${adicionales}.` : null,
     ]
         .filter(Boolean)
@@ -65,15 +166,15 @@ function datosParaBeds24(reserva, { prueba }) {
 
     return {
         status: "confirmed",
-        arrival: reserva.estancia.checkIn,
-        departure: reserva.estancia.checkOut,
-        numAdult: reserva.estancia.huespedes,
-        numChild: 0,
+        arrival: e.checkIn,
+        departure: e.checkOut,
+        numAdult: adultos,
+        numChild: menores,
         firstName: prueba ? `[PRUEBA] ${firstName}` : firstName,
         lastName,
         email: reserva.contacto.email,
         phone: reserva.contacto.telefono,
-        price: reserva.importes.total,
+        price: precioEstancia, // sin fianza
         referer: WEB_REFERER,
         apiReference: reserva.codigo,
         notes: notas.slice(0, 1500),
@@ -108,25 +209,12 @@ async function soltarBloqueo(reserva) {
 }
 
 // Alguien reservó esas noches (Booking, Airbnb...) mientras este huésped pagaba:
-// no se puede alojar a los dos, así que se le devuelve todo automáticamente.
+// no se puede alojar a los dos, así que se le devuelve todo automáticamente (fianza incluida).
 // Solo se llama si la reserva NO existe en Beds24 (comprobado justo antes).
 async function reembolsarPorConflicto(reserva, nochesOcupadas) {
     const yaDevuelto = reserva.cancelacion?.reembolsoCentimos || 0;
-    const importe = reserva.importes.totalCentimos - yaDevuelto;
-    let refundId = null;
-
-    if (importe > 0) {
-        const refund = await stripe.refunds.create(
-            {
-                payment_intent: reserva.pago.paymentIntentId,
-                amount: importe,
-                reason: "requested_by_customer",
-                metadata: { reservaId: String(reserva._id), codigo: reserva.codigo, motivo: "fechas_ocupadas" },
-            },
-            { idempotencyKey: `conflicto-${reserva._id}` }
-        );
-        refundId = refund.id;
-    }
+    const importe = maximoStripeDe(reserva);
+    const refundIds = importe > 0 ? await reembolsarStripe(reserva, importe, { motivo: "fechas_ocupadas", clave: `conflicto-${reserva._id}` }) : [];
 
     const motivo = `Fechas ocupadas por otra reserva mientras se pagaba (${nochesOcupadas.join(", ")}): reembolso automático`;
     reserva.cancelacion = {
@@ -134,7 +222,7 @@ async function reembolsarPorConflicto(reserva, nochesOcupadas) {
         motivo,
         por: "sistema",
         reembolsoCentimos: yaDevuelto + importe,
-        refundIds: [...(reserva.cancelacion?.refundIds || []), ...(refundId ? [refundId] : [])],
+        refundIds: [...(reserva.cancelacion?.refundIds || []), ...refundIds],
         // true solo si de verdad no existe en Beds24; si tuviera id, se cancelaría desde el panel.
         beds24Cancelada: !reserva.beds24?.bookingId,
     };
@@ -142,14 +230,13 @@ async function reembolsarPorConflicto(reserva, nochesOcupadas) {
     reserva.cambiarEstado("reembolsada", motivo.slice(0, 300));
     await reserva.save();
 
-    // TODO (emails con Brevo): avisar al huésped y al propietario.
     console.error(`🔴 CONFLICTO: reserva ${reserva.codigo} reembolsada (${euros(importe)} €). Noches ocupadas: ${nochesOcupadas.join(", ")}`);
 }
 
 /**
  * Crea en Beds24 una reserva web ya pagada.
  * Lanza error si Beds24 o Stripe fallan: el webhook responde 500 y Stripe lo reintenta.
- * @returns {Promise<{ estado: "creada"|"ya_existia"|"ya_sincronizada"|"conflicto"|"no_aplica", bookingId?: string }>}
+ * @returns {Promise<{ estado: "creada"|"ya_existia"|"ya_sincronizada"|"conflicto"|"no_aplica"|"en_curso", bookingId?: string }>}
  */
 async function sincronizarReservaWeb(reserva, { prueba = false } = {}) {
     if (reserva.beds24?.bookingId) return { estado: "ya_sincronizada", bookingId: reserva.beds24.bookingId };
@@ -267,9 +354,23 @@ async function liberarEnBeds24(reserva) {
     return canceladas;
 }
 
+// Si hay un link de pago de ampliación sin pagar, se anula (la reserva se va a cancelar).
+async function anularLinksPendientes(reserva) {
+    for (const m of reserva.modificaciones || []) {
+        if (m.estado !== "pendiente_pago") continue;
+        if (m.checkoutSessionId) {
+            await stripe.checkout.sessions.expire(m.checkoutSessionId).catch(() => {});
+        }
+        m.estado = "vencida";
+        m.reembolsoPendienteCentimos = 0;
+        m.error = "Link anulado al cancelar la reserva";
+    }
+}
+
 /**
  * Cancela una reserva web pagada: primero en Beds24 (libera las fechas) y luego
  * el reembolso en Stripe. Si se corta a mitad, se puede repetir sin duplicar nada.
+ * "total" devuelve todo lo que queda por devolver por Stripe (estancia + fianza).
  *
  * @param {import('mongoose').Document} reserva
  * @param {{ reembolso: "total"|"parcial"|"ninguno", importeCentimos?: number, motivo?: string, por?: string }} opciones
@@ -290,7 +391,7 @@ async function cancelarReservaWeb(reserva, { reembolso, importeCentimos, motivo 
     }
 
     const yaDevuelto = reserva.cancelacion?.reembolsoCentimos || 0;
-    const maximo = reserva.importes.totalCentimos - yaDevuelto;
+    const maximo = maximoStripeDe(reserva);
     let importe = 0;
     if (reembolso === "total") importe = maximo;
     if (reembolso === "parcial") {
@@ -329,6 +430,9 @@ async function cancelarReservaWeb(reserva, { reembolso, importeCentimos, motivo 
         reserva.cancelacion.por = por;
     }
 
+    // 0) Un link de ampliación sin pagar ya no tiene sentido.
+    await anularLinksPendientes(reserva);
+
     // 1) Beds24: libera las fechas en todos los canales y COMPRUEBA que se liberaron.
     //    Si Beds24 no la cancela, liberarEnBeds24 lanza error y NO se devuelve el dinero.
     if (reserva.beds24?.bookingId || reserva.estado === "pagada") {
@@ -337,20 +441,14 @@ async function cancelarReservaWeb(reserva, { reembolso, importeCentimos, motivo 
         await reserva.save();
     }
 
-    // 2) Stripe: el reembolso (solo si Beds24 ya está liberado) (va a la misma tarjeta; tarda de 5 a 10 días en verse).
+    // 2) Stripe: el reembolso (solo si Beds24 ya está liberado). Va a la misma tarjeta; tarda de 5 a 10 días en verse.
     if (importe > 0) {
-        const refund = await stripe.refunds.create(
-            {
-                payment_intent: reserva.pago.paymentIntentId,
-                amount: importe,
-                reason: "requested_by_customer",
-                metadata: { reservaId: String(reserva._id), codigo: reserva.codigo },
-            },
-            // misma petición repetida = mismo reembolso, nunca dos
-            { idempotencyKey: `cancelacion-${reserva._id}-${yaDevuelto}-${importe}` }
-        );
+        const refundIds = await reembolsarStripe(reserva, importe, {
+            motivo: "cancelacion",
+            clave: `cancelacion-${reserva._id}-${yaDevuelto}-${importe}`,
+        });
         reserva.cancelacion.reembolsoCentimos = yaDevuelto + importe;
-        reserva.cancelacion.refundIds = [...(reserva.cancelacion.refundIds || []), refund.id];
+        reserva.cancelacion.refundIds = [...(reserva.cancelacion.refundIds || []), ...refundIds];
     }
 
     // 3) Estado final
@@ -367,4 +465,75 @@ async function cancelarReservaWeb(reserva, { reembolso, importeCentimos, motivo 
     return { reembolsoCentimos: importe, totalDevueltoCentimos: totalDevuelto };
 }
 
-module.exports = { sincronizarReservaWeb, cancelarReservaWeb, CancelacionError, WEB_REFERER, separarNombre };
+/**
+ * Devuelve la fianza al terminar la estancia (desde el panel).
+ * Sin importeCentimos devuelve toda la fianza pendiente; con importe, solo esa parte
+ * (por ejemplo, si hubo algún daño). La reserva sigue "pagada": no se cancela nada en Beds24.
+ *
+ * @param {import('mongoose').Document} reserva
+ * @param {{ importeCentimos?: number, nota?: string, por?: string }} [opciones]
+ * @returns {Promise<{ devueltoCentimos: number, totalDevueltoCentimos: number, pendienteCentimos: number }>}
+ */
+async function devolverFianza(reserva, { importeCentimos, nota = "", por = "admin" } = {}) {
+    if (reserva.estado !== "pagada") {
+        throw new CancelacionError(
+            "ESTADO_NO_VALIDO",
+            "Solo se puede devolver la fianza de reservas pagadas y activas. Si la reserva se canceló, la fianza se devuelve con la cancelación.",
+            409
+        );
+    }
+
+    const fianza = fianzaCentimosDe(reserva);
+    const yaDevuelta = fianzaDevueltaDe(reserva);
+    const pendiente = Math.min(fianza - yaDevuelta, maximoStripeDe(reserva));
+    if (pendiente <= 0) {
+        throw new CancelacionError("FIANZA_DEVUELTA", "La fianza de esta reserva ya está devuelta.", 409);
+    }
+
+    const importe = importeCentimos === undefined ? pendiente : importeCentimos;
+    if (!Number.isInteger(importe) || importe < 1 || importe > pendiente) {
+        throw new CancelacionError("DATOS_INVALIDOS", `La devolución tiene que estar entre 0,01 € y ${euros(pendiente)} €.`, 400, {
+            errors: { importe: `Entre 0,01 € y ${euros(pendiente)} €.` },
+        });
+    }
+
+    const refundIds = await reembolsarStripe(reserva, importe, {
+        motivo: "devolucion_fianza",
+        clave: `fianza-${reserva._id}-${yaDevuelta}-${importe}`,
+    });
+
+    if (!reserva.devolucionFianza) reserva.devolucionFianza = {};
+    reserva.devolucionFianza.centimos = yaDevuelta + importe;
+    reserva.devolucionFianza.fecha = new Date();
+    reserva.devolucionFianza.por = por;
+    reserva.devolucionFianza.nota = String(nota || "").trim().slice(0, 300);
+    reserva.devolucionFianza.refundIds = [...(reserva.devolucionFianza.refundIds || []), ...refundIds];
+    reserva.historialEstados.push({
+        estado: reserva.estado,
+        fecha: new Date(),
+        motivo: `Fianza devuelta por ${por}: ${euros(importe)} € de ${euros(fianza)} €`.slice(0, 300),
+    });
+    await reserva.save();
+
+    console.log(`💶 Reserva ${reserva.codigo}: fianza devuelta ${euros(importe)} € (${refundIds.join(", ")})`);
+    return {
+        devueltoCentimos: importe,
+        totalDevueltoCentimos: reserva.devolucionFianza.centimos,
+        pendienteCentimos: fianza - reserva.devolucionFianza.centimos,
+    };
+}
+
+module.exports = {
+    sincronizarReservaWeb,
+    cancelarReservaWeb,
+    devolverFianza,
+    reembolsarStripe,
+    cobradoStripeDe,
+    devueltoStripeDe,
+    maximoStripeDe,
+    estanciaCentimosDe,
+    nochesDe,
+    CancelacionError,
+    WEB_REFERER,
+    separarNombre,
+};

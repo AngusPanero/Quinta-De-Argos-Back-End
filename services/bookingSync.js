@@ -1,33 +1,38 @@
 // Sincronización Beds24 → Mongo, webhook y caché del calendario.
 const Beds24Booking = require("../models/Beds24Booking");
+const Reserva = require("../models/Reserva"); // ⚠️ AJUSTAR: el modelo de las reservas web (el que tiene beds24.bookingId)
 const { fetchBookings, fetchBookingById, fetchCalendar, ROOM_ID } = require("./beds24Service");
 const { todayMadrid, nightsBetween } = require("../utils/dates");
-
-// Referer que va a usar la web cuando cree reservas (fase 3)
-const WEB_REFERER = "quintadeargos.com";
 
 // Campos personales: el webhook "no personal data" no los trae,
 // así que solo se escriben si vienen en la respuesta
 const PERSONAL_FIELDS = ["firstName", "lastName", "email", "phone", "mobile", "country2", "lang", "comments"];
 
-function detectSource(b) {
+// Beds24 guarda las reservas creadas por la web con referer "API" y channel "direct",
+// así que la única forma fiable de reconocerlas es cruzar con nuestras reservas web.
+async function isWebBooking(beds24Id) {
+    if (!beds24Id) return false;
+    return !!(await Reserva.exists({ "beds24.bookingId": String(beds24Id) }));
+}
+
+function detectSource(b, isWeb) {
     if (b.status === "black") return "owner";
     if (b.channel === "airbnb") return "airbnb";
     if (b.channel === "booking") return "booking";
-    if (b.referer === WEB_REFERER) return "web";
+    if (isWeb || String(b.apiReference || "").startsWith("QA-")) return "web";
     return "direct";
 }
 
 const toDate = (value) => (value ? new Date(value) : null);
 const toNumber = (value) => (typeof value === "number" ? value : null);
 
-function mapBooking(b) {
+function mapBooking(b, isWeb = false) {
     const doc = {
         beds24Id: b.id,
         propertyId: b.propertyId,
         roomId: b.roomId,
         status: b.status,
-        source: detectSource(b),
+        source: detectSource(b, isWeb),
         channel: b.channel || null,
         apiSource: b.apiSource || null,
         apiReference: b.apiReference || null,
@@ -58,7 +63,8 @@ function mapBooking(b) {
 async function upsertBooking(b) {
     if (!b || Number(b.roomId) !== ROOM_ID) return { skipped: true };
 
-    const doc = mapBooking(b);
+    const isWeb = await isWebBooking(b.id);
+    const doc = mapBooking(b, isWeb);
     const filter = { beds24Id: doc.beds24Id };
     if (doc.modifiedTime) {
         filter.$or = [{ modifiedTime: { $lte: doc.modifiedTime } }, { modifiedTime: null }];
@@ -71,6 +77,12 @@ async function upsertBooking(b) {
         if (err?.code === 11000) return { stale: true };
         throw err;
     }
+}
+
+// Para llamar desde el router de pagos justo después de guardar beds24.bookingId:
+// si el webhook de Beds24 llegó antes y la guardó como "direct", la corrige.
+async function markAsWeb(beds24Id) {
+    await Beds24Booking.updateOne({ beds24Id: Number(beds24Id) }, { $set: { source: "web" } });
 }
 
 // ---------- Caché del calendario ----------
@@ -178,4 +190,5 @@ module.exports = {
     handleWebhookBooking,
     getCalendar,
     invalidateCalendarCache,
+    markAsWeb,
 };

@@ -9,6 +9,8 @@
 //        payment_intent.payment_failed  pago rechazado           -> pago_fallido (+ aviso si estaba pendiente)
 //        payment_intent.canceled        pago cancelado en Stripe -> cancelada (+ aviso si estaba pendiente)
 //        charge.refunded                reembolso                -> aviso de cancelación/reembolso
+//        checkout.session.completed     link de ampliación pagado -> confirma el cambio de fechas
+//        checkout.session.expired       link de ampliación vencido -> la reserva vuelve a sus fechas
 //
 // Todos los correos los arma y envía notificarReserva() de contactRouter.
 // Aquí solo se decide CUÁNDO avisar.
@@ -17,8 +19,9 @@
 // porque el webhook necesita el body sin parsear para verificar la firma.
 // Por eso cada ruta declara su propio parser.
 //
-// Del front solo se aceptan: fechas, huéspedes, ids de adicionales, contacto,
-// facturación y las casillas de consentimiento. Ningún importe del front se usa jamás.
+// Del front solo se aceptan: fechas, huéspedes (adultos, menores y cuna), ids de adicionales,
+// contacto, facturación y las casillas de consentimiento. Ningún importe del front se usa jamás.
+// El total que se cobra incluye la fianza (60 € por persona), calculada en reservasService.
 
 const express = require("express");
 const { stripe } = require("../config/stripe");
@@ -28,6 +31,11 @@ const { cotizarReserva, limitesReserva, cargarPreciosWeb, ReservaError } = requi
 const { validarDatosCliente } = require("../services/datosClienteService");
 const { sincronizarReservaWeb } = require("../services/reservaWebBeds24Service");
 const { notificarReserva } = require("./contactRouter");
+const { completarPagoAmpliacion, vencerPagoAmpliacion } = require("../services/modificacionReservaService");
+
+// Los pagos de ampliación (link de Stripe Checkout del panel) tienen su propio flujo:
+// los PaymentIntent que generan no deben tratarse como reservas nuevas.
+const esAmpliacion = (objeto) => objeto?.metadata?.tipo === "ampliacion";
 const { MONEDA } = require("../config/reservasConfig");
 
 const paymentsRouter = express.Router();
@@ -60,6 +68,7 @@ async function buscarReservaDelPago(paymentIntent) {
 
 // ---------- Pago aprobado ----------
 async function confirmBooking(paymentIntent) {
+    if (esAmpliacion(paymentIntent)) return; // lo gestiona checkout.session.completed
     const reserva = await buscarReservaDelPago(paymentIntent);
     if (!reserva) {
         // Por ejemplo, eventos de prueba lanzados con `stripe trigger`.
@@ -98,6 +107,7 @@ async function confirmBooking(paymentIntent) {
 
 // ---------- Pago pendiente (SEPA y otros métodos que tardan) ----------
 async function handleProcessingPayment(paymentIntent) {
+    if (esAmpliacion(paymentIntent)) return;
     const reserva = await buscarReservaDelPago(paymentIntent);
     if (!reserva) {
         console.warn("⚠️ Pago pendiente sin reserva asociada:", paymentIntent.id);
@@ -119,6 +129,7 @@ async function handleProcessingPayment(paymentIntent) {
 
 // ---------- Pago rechazado ----------
 async function handleFailedPayment(paymentIntent) {
+    if (esAmpliacion(paymentIntent)) return;
     const reserva = await buscarReservaDelPago(paymentIntent);
     const mensaje = paymentIntent.last_payment_error?.message || "Pago rechazado";
     console.warn("❌ Pago fallido:", paymentIntent.id, mensaje);
@@ -139,6 +150,7 @@ async function handleFailedPayment(paymentIntent) {
 
 // ---------- Pago cancelado en Stripe ----------
 async function handleCanceledPayment(paymentIntent) {
+    if (esAmpliacion(paymentIntent)) return;
     const reserva = await buscarReservaDelPago(paymentIntent);
     if (!reserva || !["pendiente_pago", "pago_fallido"].includes(reserva.estado)) return;
 
@@ -155,12 +167,15 @@ async function handleCanceledPayment(paymentIntent) {
     console.log("📨 Avisos de pago cancelado:", reserva.codigo, avisos);
 }
 
-// ---------- Reembolsos (cancelaciones del panel, fechas ocupadas o desde Stripe) ----------
+// ---------- Reembolsos (cancelaciones del panel, fechas ocupadas, fianza o desde Stripe) ----------
 async function handleChargeRefunded(charge) {
     const paymentIntentId = typeof charge.payment_intent === "string" ? charge.payment_intent : charge.payment_intent?.id;
     if (!paymentIntentId) return;
 
-    let reserva = await Reserva.findOne({ "pago.paymentIntentId": paymentIntentId });
+    // El reembolso puede ser del pago original o del de una ampliación.
+    let reserva = await Reserva.findOne({
+        $or: [{ "pago.paymentIntentId": paymentIntentId }, { "pagosExtra.paymentIntentId": paymentIntentId }],
+    });
     if (!reserva) {
         console.warn("⚠️ Reembolso sin reserva asociada:", paymentIntentId);
         return;
@@ -196,12 +211,12 @@ paymentsRouter.post("/intent", express.json({ limit: "20kb" }), async (req, res)
         // a) Datos del cliente y consentimientos (antes de llamar a nadie).
         const { contacto, facturacion, consentimientos } = validarDatosCliente(req.body, req);
 
-        // b) Disponibilidad en FRESCO (sin caché) y precio calculado aquí.
-        const { checkIn, checkOut, guests, adicionales } = req.body ?? {};
+        // b) Disponibilidad en FRESCO (sin caché) y precio calculado aquí (incluye la fianza).
+        const { checkIn, checkOut, guests, adultos, menores, cuna, adicionales } = req.body ?? {};
         const { hoy, ultimaNoche } = limitesReserva();
         const ocupadas = await getNochesOcupadas(hoy, ultimaNoche, { fresco: true });
         await cargarPreciosWeb(); // precios de la web en fresco (los edita el panel)
-        const presupuesto = cotizarReserva({ checkIn, checkOut, guests, adicionales }, ocupadas);
+        const presupuesto = cotizarReserva({ checkIn, checkOut, guests, adultos, menores, cuna, adicionales }, ocupadas);
 
         // c) Guardamos la reserva ANTES de cobrar, con los consentimientos registrados.
         reserva = await crearReservaPendiente({
@@ -210,6 +225,9 @@ paymentsRouter.post("/intent", express.json({ limit: "20kb" }), async (req, res)
                 checkOut: presupuesto.checkOut,
                 noches: presupuesto.noches,
                 huespedes: presupuesto.guests,
+                adultos: presupuesto.adultos,
+                menores: presupuesto.menores,
+                cuna: presupuesto.cuna,
             },
             importes: {
                 moneda: MONEDA,
@@ -217,12 +235,15 @@ paymentsRouter.post("/intent", express.json({ limit: "20kb" }), async (req, res)
                 alojamiento: presupuesto.alojamiento,
                 adicionales: presupuesto.adicionales,
                 totalAdicionales: presupuesto.totalAdicionales,
+                fianza: presupuesto.fianza,
                 total: presupuesto.total,
                 totalCentimos: presupuesto.totalCentimos,
             },
             contacto,
             facturacion,
             consentimientos,
+            // Lo cobrado en este pago: los importes pueden cambiar después si se modifican las fechas.
+            pago: { importeCentimos: presupuesto.totalCentimos },
         });
 
         // d) PaymentIntent. En Stripe solo van los datos imprescindibles:
@@ -233,12 +254,13 @@ paymentsRouter.post("/intent", express.json({ limit: "20kb" }), async (req, res)
                 currency: MONEDA,
                 automatic_payment_methods: { enabled: true },
                 receipt_email: contacto.email,
-                description: `Reserva ${reserva.codigo} · Quinta de Argos ${presupuesto.checkIn} → ${presupuesto.checkOut}`,
+                description: `Reserva ${reserva.codigo} · Quinta de Argos ${presupuesto.checkIn} → ${presupuesto.checkOut} (incluye fianza reembolsable de ${presupuesto.fianza.total} €)`,
                 metadata: {
                     reservaId: String(reserva._id),
                     codigo: reserva.codigo,
                     checkIn: presupuesto.checkIn,
                     checkOut: presupuesto.checkOut,
+                    fianzaCentimos: String(presupuesto.fianza.totalCentimos),
                 },
             },
             { idempotencyKey: `reserva-${reserva._id}` }
@@ -321,6 +343,16 @@ paymentsRouter.post("/webhook", express.raw({ type: "application/json" }), async
                 break;
             case "charge.refunded":
                 await handleChargeRefunded(event.data.object);
+                break;
+            // Links de pago de ampliación (cambio de fechas desde el panel)
+            case "checkout.session.completed":
+            case "checkout.session.async_payment_succeeded":
+                if (esAmpliacion(event.data.object) && event.data.object.payment_status === "paid") {
+                    await completarPagoAmpliacion(event.data.object);
+                }
+                break;
+            case "checkout.session.expired":
+                if (esAmpliacion(event.data.object)) await vencerPagoAmpliacion(event.data.object);
                 break;
             default:
                 break;

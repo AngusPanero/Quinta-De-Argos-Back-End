@@ -39,6 +39,20 @@ async function crearReservaBeds24(datos) {
     return String(id);
 }
 
+/**
+ * Modifica una reserva existente (fechas, precio...). Es la MISMA reserva:
+ * Beds24 envía el cambio a Booking y Airbnb.
+ * @param {string|number} bookingId
+ * @param {{ arrival?: string, departure?: string, price?: number, notes?: string }} cambios
+ */
+async function modificarReservaBeds24(bookingId, cambios) {
+    const data = await beds24Request("/bookings", {
+        method: "POST",
+        body: [{ id: Number(bookingId), ...cambios }],
+    });
+    primerResultado(data, "modificar la reserva");
+}
+
 /** Cancela una reserva: deja de ocupar las fechas en todos los canales. */
 async function cancelarReservaBeds24(bookingId) {
     const data = await beds24Request("/bookings", {
@@ -145,6 +159,7 @@ module.exports = {
     ESTADOS_QUE_OCUPAN,
     Beds24WriteError,
     crearReservaBeds24,
+    modificarReservaBeds24,
     cancelarReservaBeds24,
     estadoReservaBeds24,
     liberarSiSigueActiva,
