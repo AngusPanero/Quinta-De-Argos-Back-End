@@ -15,6 +15,9 @@
 //        }
 //        -> cambia la reserva en Beds24 (llega a Airbnb/Booking) y en la web,
 //           devuelve dinero y/o cobra la diferencia (link de Stripe o transferencia).
+//   POST /api/admin/reservas-web/:id/modificar/liberar   (con firma)  { checkIn, checkOut, pin }
+//        -> libera las noches nuevas ocupadas por algo colgado (reserva web cancelada,
+//           sin pagar o duplicada que sigue en Beds24, o un cierre manual) y vuelve a calcular.
 //
 // IMPORTANTE: en index.js, montar DESPUÉS de app.use(express.json()):
 //   app.use(require("./routes/modificacionesRouter"));
@@ -25,7 +28,7 @@ const Reserva = require("../models/Reserva");
 const adminMiddleware = require("../middleware/adminMiddleware");
 const requireFreshAdmin = require("../middleware/requireFreshAdmin");
 const { requireSignature, audit } = require("../middleware/requireSignature");
-const { calcularModificacion, aplicarModificacion, ModificacionError } = require("../services/modificacionReservaService");
+const { calcularModificacion, aplicarModificacion, liberarBloqueos, ModificacionError } = require("../services/modificacionReservaService");
 const { CancelacionError } = require("../services/reservaWebBeds24Service");
 const { Beds24WriteError } = require("../services/beds24BookingsService");
 
@@ -153,6 +156,41 @@ modificacionesRouter.post(
             res.json(resultado);
         } catch (error) {
             manejarError(res, error, "modificando la reserva");
+        } finally {
+            enCurso.delete(id);
+        }
+    }
+);
+
+// ---------- Liberar noches colgadas (con firma) ----------
+modificacionesRouter.post(
+    "/api/admin/reservas-web/:id/modificar/liberar",
+    adminMiddleware,
+    requireFreshAdmin,
+    requireSignature(SECCION_FIRMA),
+    async (req, res) => {
+        const { id } = req.params;
+        if (enCurso.has(id)) {
+            return errorRespuesta(res, 409, "EN_CURSO", "Ya se está modificando esta reserva. Espera unos segundos.");
+        }
+        enCurso.add(id);
+        try {
+            const reserva = await cargarReserva(req, res);
+            if (!reserva) return;
+            const resultado = await liberarBloqueos(reserva, {
+                checkIn: fecha(req.body?.checkIn),
+                checkOut: fecha(req.body?.checkOut),
+                por: quien(req),
+            });
+            await audit(req, SECCION_FIRMA, "ok", {
+                accion: "liberar_noches",
+                codigo: reserva.codigo,
+                reservasCanceladas: resultado.liberadas,
+                cierresQuitados: resultado.cierresQuitados,
+            });
+            res.json(resultado);
+        } catch (error) {
+            manejarError(res, error, "liberando noches");
         } finally {
             enCurso.delete(id);
         }

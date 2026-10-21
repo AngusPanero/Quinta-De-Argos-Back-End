@@ -1352,9 +1352,10 @@ async function notificarReserva(evento, reserva, opciones = {}) {
 // 4e) CAMBIO DE FECHAS (modificaciones desde el panel)
 //     notificarModificacion(reserva, modificacion, evento, { prueba })
 //       "aplicada"        fechas cambiadas (sin cobro o pagado por transferencia)
-//       "pendiente_pago"  fechas cambiadas y bloqueadas; link de pago de Stripe al huésped
-//       "pagada"          el huésped pagó el link: ampliación confirmada
-//       "vencida"         el link venció sin pagar: la reserva vuelve a sus fechas
+//       "pendiente_pago"  link de pago de Stripe al huésped (la reserva aún no cambia)
+//       "pagada"          el huésped pagó el link: cambio aplicado y confirmado
+//       "vencida"         el link venció sin pagar: la reserva sigue con sus fechas
+//       "rechazada"       pagó, pero las noches ya no estaban libres: pago devuelto entero
 //     Los reembolsos (si los hay) llegan además con su propio correo por charge.refunded.
 // ==========================================================
 
@@ -1363,10 +1364,16 @@ function rangoTexto(e) {
     return `${fechaLarga(e.checkIn)} → ${fechaLarga(e.checkOut)} (${e.noches} ${e.noches === 1 ? "noche" : "noches"})`;
 }
 
-function filasCambio(m) {
+// Con el cambio sin aplicar (link pendiente, vencido o rechazado) no hay "antes/ahora".
+const SIN_APLICAR = new Set(["pendiente_pago", "vencida", "rechazada"]);
+const etiquetasCambio = (evento) =>
+    SIN_APLICAR.has(evento) ? ["Fechas actuales", "Fechas solicitadas"] : ["Antes", "Ahora"];
+
+function filasCambio(m, evento) {
+    const [antes, despues] = etiquetasCambio(evento);
     const filas = [
-        { label: "Antes", value: rangoTexto(m.antes) },
-        { label: "Ahora", value: rangoTexto(m.despues) },
+        { label: antes, value: rangoTexto(m.antes) },
+        { label: despues, value: rangoTexto(m.despues) },
     ];
     if (m.nochesNuevas?.length) {
         filas.push({
@@ -1376,7 +1383,11 @@ function filasCambio(m) {
     }
     if (m.fianzaAdicionalCentimos > 0) filas.push({ label: "Fianza adicional", value: centimosAEuros(m.fianzaAdicionalCentimos) });
     if (m.nochesQuitadas?.length) filas.push({ label: "Noches quitadas", value: String(m.nochesQuitadas.length) });
-    if (m.cargoCentimos > 0) filas.push({ label: "A pagar", value: centimosAEuros(m.cargoCentimos) });
+    if (evento === "rechazada") {
+        filas.push({ label: "Pago devuelto", value: centimosAEuros(m.cargoCentimos) });
+        return filas;
+    }
+    if (m.cargoCentimos > 0) filas.push({ label: evento === "pagada" ? "Pagado" : "A pagar", value: centimosAEuros(m.cargoCentimos) });
     const devolucion = (m.reembolsoCentimos || 0) + (m.reembolsoPendienteCentimos || 0);
     if (devolucion > 0) filas.push({ label: "Devolución", value: centimosAEuros(devolucion) });
     return filas;
@@ -1400,10 +1411,10 @@ const TEXTOS_MODIFICACION = {
         cabecera: "Pago<br />pendiente",
         asunto: (r) => `Completa el pago para ampliar tu reserva ${r.codigo} — Quinta de Argos`,
         intro: (r, m) =>
-            `Hemos reservado para ti las nuevas fechas de tu estancia. Para confirmarlas, paga la diferencia de <strong>${escapeHtml(
+            `Para cambiar las fechas de tu reserva <strong>${escapeHtml(r.codigo)}</strong>, paga la diferencia de <strong>${escapeHtml(
                 centimosAEuros(m.cargoCentimos)
-            )}</strong> con el botón de abajo. <strong>El enlace caduca en 23 horas</strong>: si no se paga, tu reserva vuelve a sus fechas originales.`,
-        finca: "Fechas nuevas bloqueadas en Beds24 a la espera del pago del huésped (link de Stripe, 23 h). Si no paga, se vuelven a las fechas anteriores.",
+            )}</strong> con el botón de abajo. En cuanto recibamos el pago, tu reserva se actualiza con las nuevas fechas y te lo confirmamos por correo. <strong>El enlace caduca en 23 horas</strong>; hasta entonces tu reserva mantiene sus fechas actuales.`,
+        finca: "Link de pago enviado al huésped (Stripe, 23 h). La reserva NO cambia hasta que pague: al pagar se actualiza sola en la web y en Beds24 (Booking y Airbnb). Si no paga, sigue igual.",
     },
     pagada: {
         etiqueta: "Ampliación confirmada",
@@ -1413,7 +1424,7 @@ const TEXTOS_MODIFICACION = {
             `Hemos recibido el pago de <strong>${escapeHtml(centimosAEuros(m.cargoCentimos))}</strong>. Las nuevas fechas de tu reserva <strong>${escapeHtml(
                 r.codigo
             )}</strong> quedan confirmadas.`,
-        finca: "El huésped ha pagado el link: la ampliación queda confirmada.",
+        finca: "El huésped ha pagado el link: la reserva ya tiene las fechas nuevas en la web y en Beds24 (Booking y Airbnb se actualizan solos).",
     },
     vencida: {
         etiqueta: "Ampliación no completada",
@@ -1423,7 +1434,19 @@ const TEXTOS_MODIFICACION = {
             `El enlace de pago ha caducado sin completarse, así que tu reserva <strong>${escapeHtml(
                 r.codigo
             )}</strong> mantiene sus fechas originales. Si todavía quieres ampliarla, escríbenos.`,
-        finca: "El link de pago venció sin pagar: la reserva ha vuelto a sus fechas anteriores en Beds24.",
+        finca: "El link de pago venció sin pagar: la reserva sigue con sus fechas (no se cambió nada).",
+    },
+    rechazada: {
+        etiqueta: "Ampliación no disponible",
+        cabecera: "Ampliación<br />no disponible",
+        asunto: (r) => `No hemos podido ampliar tu reserva ${r.codigo} — Quinta de Argos`,
+        intro: (r, m) =>
+            `Lo sentimos: las nuevas fechas se reservaron antes de recibir tu pago, así que no hemos podido cambiar tu reserva <strong>${escapeHtml(
+                r.codigo
+            )}</strong>. Te devolvemos íntegro el pago de <strong>${escapeHtml(
+                centimosAEuros(m.cargoCentimos)
+            )}</strong> al mismo medio de pago (5-10 días hábiles). Tu reserva mantiene sus fechas. Si quieres buscar otras fechas, escríbenos.`,
+        finca: "El huésped pagó el link, pero las noches nuevas ya no estaban libres: se le ha devuelto el pago entero y la reserva sigue con sus fechas.",
     },
 };
 
@@ -1451,8 +1474,8 @@ async function notificarModificacion(reserva, mod, evento, { prueba = false } = 
                 ${botonPago ? `<div style="margin:0 0 24px;">${botonPago}</div>` : ""}
                 ${avisoPrueba(prueba)}
                 ${divisor}
-                ${tablaDatos(filasCambio(m), "Cambio de fechas")}
-                ${tablaReserva(estanciaDe(r), evento === "vencida" ? "Tu reserva (fechas originales)" : "Tu reserva")}
+                ${tablaDatos(filasCambio(m, evento), "Cambio de fechas")}
+                ${tablaReserva(estanciaDe(r), SIN_APLICAR.has(evento) ? "Tu reserva (fechas actuales)" : "Tu reserva")}
                 ${parrafo("Si tienes cualquier duda, responde a este correo o escríbenos por WhatsApp.")}
                 <div style="margin:0 0 20px;">${botonWhatsApp()}</div>`,
             text: [
@@ -1460,8 +1483,8 @@ async function notificarModificacion(reserva, mod, evento, { prueba = false } = 
                 "",
                 t.intro(r, m).replace(/<[^>]+>/g, ""),
                 evento === "pendiente_pago" && m.checkoutUrl ? `\nPagar: ${m.checkoutUrl}\n` : "",
-                `Antes: ${rangoTexto(m.antes)}`,
-                `Ahora: ${rangoTexto(m.despues)}`,
+                `${etiquetasCambio(evento)[0]}: ${rangoTexto(m.antes)}`,
+                `${etiquetasCambio(evento)[1]}: ${rangoTexto(m.despues)}`,
                 "",
                 `${EMPRESA.nombre} · WhatsApp ${EMPRESA.whatsappTexto}`,
             ].join("\n"),
@@ -1508,7 +1531,7 @@ async function notificarModificacion(reserva, mod, evento, { prueba = false } = 
                     ${divisor}
                     ${tablaDatos(
                         [
-                            ...filasCambio(m),
+                            ...filasCambio(m, evento),
                             { label: "Cobro", value: m.metodoCobro === "stripe" ? "Link de Stripe" : m.metodoCobro === "transferencia" ? "Transferencia (la gestionas tú)" : "Sin cobro" },
                         ],
                         "Cambio de fechas"
@@ -1517,7 +1540,12 @@ async function notificarModificacion(reserva, mod, evento, { prueba = false } = 
                     ${tablaDatos(filasImporteDe(r), "Importe actual (IVA incluido)")}`,
                 notaPie: "Aviso automático de reservas de quintadeargos.com.",
             }),
-            text: [`${t.etiqueta} — ${r.codigo}`, t.finca, `Antes: ${rangoTexto(m.antes)}`, `Ahora: ${rangoTexto(m.despues)}`].join("\n"),
+            text: [
+                `${t.etiqueta} — ${r.codigo}`,
+                t.finca,
+                `${etiquetasCambio(evento)[0]}: ${rangoTexto(m.antes)}`,
+                `${etiquetasCambio(evento)[1]}: ${rangoTexto(m.despues)}`,
+            ].join("\n"),
             replyTo: r.contacto?.email ? { email: r.contacto.email, name: r.contacto.nombre } : undefined,
         });
     } catch (e) {

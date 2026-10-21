@@ -26,6 +26,7 @@ const requireFreshAdmin = require("../middleware/requireFreshAdmin");
 const { requireSignature, audit } = require("../middleware/requireSignature");
 const { hoyEnEspana } = require("../services/reservasService");
 const { devolverFianza, maximoStripeDe, CancelacionError } = require("../services/reservaWebBeds24Service");
+const { conciliarLinksPendientes } = require("../services/modificacionReservaService");
 
 const esProduccion = process.env.NODE_ENV === "production";
 const fianzasRouter = express.Router();
@@ -95,6 +96,9 @@ function aCentimos(valor) {
 // ---------- GET: fianzas pendientes + política de cada reserva web ----------
 fianzasRouter.get("/api/admin/fianzas", adminMiddleware, async (req, res) => {
     try {
+        // Por si el webhook de Stripe no llegó: aplica links ya pagados o vencidos.
+        await conciliarLinksPendientes();
+
         const hoy = hoyEnEspana();
         const reservas = await Reserva.find(
             { estado: "pagada" },

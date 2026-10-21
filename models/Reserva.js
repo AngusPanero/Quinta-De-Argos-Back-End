@@ -117,10 +117,11 @@ const pagoExtraSchema = new mongoose.Schema(
 const modificacionSchema = new mongoose.Schema(
     {
         // aplicada: hecha (transferencia o sin cobro)
-        // pendiente_pago: fechas ya cambiadas y bloqueadas, esperando el pago del link de Stripe
-        // pagada: el huésped pagó el link
-        // vencida: el link caducó sin pagar y la reserva volvió a sus fechas
-        estado: { type: String, enum: ["aplicada", "pendiente_pago", "pagada", "vencida"], required: true },
+        // pendiente_pago: link de Stripe enviado; la reserva NO cambia hasta que pague
+        // pagada: el huésped pagó el link y el cambio se aplicó (web + Beds24)
+        // vencida: el link caducó sin pagar; la reserva sigue con sus fechas
+        // rechazada: pagó, pero las noches nuevas ya no estaban libres; se le devolvió el pago
+        estado: { type: String, enum: ["aplicada", "pendiente_pago", "pagada", "vencida", "rechazada"], required: true },
         fecha: { type: Date, default: Date.now },
         por: { type: String, default: "" },
         nota: { type: String, default: "", maxlength: 300 },
@@ -135,8 +136,11 @@ const modificacionSchema = new mongoose.Schema(
             checkOut: { type: String, required: true },
             noches: { type: Number, required: true },
         },
-        // Copia de los importes antes del cambio (para volver atrás si el link vence)
+        // Copia de los importes antes del cambio
         importesAntes: { type: mongoose.Schema.Types.Mixed, default: null },
+        // Importes con las fechas nuevas (con link de Stripe se aplican al recibir el pago,
+        // con los precios del día en que se generó el link)
+        importesDespues: { type: mongoose.Schema.Types.Mixed, default: null },
 
         nochesQuitadas: { type: [nocheSchema], default: [] }, // con el precio que se pagó
         nochesNuevas: { type: [nocheSchema], default: [] }, // con el precio web del día del cambio
