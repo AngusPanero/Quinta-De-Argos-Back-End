@@ -17,7 +17,7 @@ contadorSchema.statics.siguiente = async function (clave) {
     const doc = await this.findOneAndUpdate(
         { _id: clave },
         { $inc: { valor: 1 } },
-        { new: true, upsert: true }
+        { returnDocument: "after", upsert: true }
     );
     return doc.valor;
 };

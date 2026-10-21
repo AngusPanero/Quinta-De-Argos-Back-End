@@ -71,7 +71,7 @@ const WEB_URL = (process.env.FRONT_END || "https://quintadeargos.com").replace(/
 // ---------- Datos de la empresa (cámbialos aquí si cambian) ----------
 const EMPRESA = {
     nombre: "Quinta de Argos",
-    lema: "Finca con piscina en Cehegín",
+    lema: "El refugio de tus sueños",
     localidad: "Cehegín, Región de Murcia · España",
     email: "quintadeargos@gmail.com",
     whatsappTexto: "+34 633 49 18 25",
@@ -1926,3 +1926,27 @@ module.exports.notificarReserva = notificarReserva;
 // Para services/modificacionReservaService.js: avisos de cambio de fechas
 module.exports.notificarModificacion = notificarModificacion;
 module.exports.enviarEmailConfirmacionReserva = enviarEmailConfirmacionReserva;
+// Para routes/instruccionesCasaRouter.js: misma plantilla y envío que el resto de correos
+module.exports.plantillaCorreo = {
+    sendMail,
+    layout,
+    EMPRESA,
+    C,
+    SANS,
+    SERIF,
+    BUZON_FINCA,
+    escapeHtml,
+    etiqueta,
+    titulo,
+    parrafo,
+    divisor,
+    tablaDatos,
+    bloqueTexto,
+    boton,
+    botonWhatsApp,
+    fechaLarga,
+    nombreDePila,
+    tablaReserva,
+    estanciaDe,
+    prefijoPrueba,
+};

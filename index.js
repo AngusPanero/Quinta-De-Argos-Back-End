@@ -18,6 +18,7 @@ const sesHospedajesRouter = require("./routes/sesHospedajesRouter")
 const adminPreciosWebRouter = require("./routes/adminPreciosWebRouter")
 const fianzasRouter = require("./routes/fianzasRouter")
 const modificacionesRouter = require("./routes/modificacionesRouter")
+const instruccionesCasaRouter = require("./routes/instruccionesCasaRouter")
 const { startBeds24TarifasJob } = require("./data/tarifas")
 
 const app = express()
@@ -55,6 +56,7 @@ app.use(sesHospedajesRouter)
 app.use(adminPreciosWebRouter)
 app.use(fianzasRouter)
 app.use(modificacionesRouter)
+app.use(instruccionesCasaRouter)
 
 app.use((req,res) => {
     res.send(`<h1>404 - Not Found</h1>`)

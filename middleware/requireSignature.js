@@ -36,7 +36,7 @@ async function registerFailedAttempt(adminUid) {
     const guard = await AdminSignGuard.findOneAndUpdate(
         { adminUid },
         { $inc: { failedCount: 1 }, $set: { lastFailedAt: new Date() } },
-        { upsert: true, new: true }
+        { upsert: true, returnDocument: "after" }
     );
     if (guard.failedCount >= MAX_FAILED_ATTEMPTS) {
         const lockedUntil = new Date(Date.now() + LOCK_MINUTES * 60 * 1000);

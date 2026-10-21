@@ -190,7 +190,7 @@ authRouter.post("/login-failed", async (req, res) => {
                 $inc: { attempts: 1 },
                 $set: { lastAttemptAt: now }
             },
-            { upsert: true, new: true } // Esto si no existe lo creó aca
+            { upsert: true, returnDocument: "after" } // si no existe, lo crea acá
         )
         if(attempt.attempts >= 5){
             const user = await auth.getUserByEmail(email)

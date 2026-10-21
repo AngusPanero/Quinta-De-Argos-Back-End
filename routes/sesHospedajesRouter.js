@@ -941,7 +941,7 @@ sesHospedajesRouter.put("/api/admin/ses/partes/:id", adminMiddleware, async (req
         const parte = await ParteViajeros.findOneAndUpdate(
             { _id: req.params.id, estado: { $in: ["borrador", "error"] } },
             { $set: { contrato: value.contrato, personas: value.personas } },
-            { new: true }
+            { returnDocument: "after" }
         ).select("-__v");
         if (!parte) return res.status(409).json({ message: "Este parte ya se ha enviado y no se puede editar" });
         res.json({ parte });
@@ -988,7 +988,7 @@ sesHospedajesRouter.post("/api/admin/ses/partes/:id/enviar", adminMiddleware, as
     const bloqueado = await ParteViajeros.findOneAndUpdate(
         { _id: parte._id, estado: { $in: ["borrador", "error"] } },
         { $set: { estado: "enviando" } },
-        { new: true }
+        { returnDocument: "after" }
     );
     if (!bloqueado) return res.status(409).json({ message: "Este parte ya se ha enviado" });
 
@@ -1051,7 +1051,7 @@ sesHospedajesRouter.post("/api/admin/ses/partes/:id/anular", adminMiddleware, as
         parte = await ParteViajeros.findOneAndUpdate(
             { _id: req.params.id, estado: "comunicado", codigoComunicacion: { $ne: null } },
             { $set: { estado: "enviando" } },
-            { new: true }
+            { returnDocument: "after" }
         );
     } catch {
         return res.status(400).json({ message: "Identificador no válido" });
