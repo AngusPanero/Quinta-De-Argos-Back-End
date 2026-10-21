@@ -27,6 +27,7 @@ const zlib = require("zlib");
 const adminMiddleware = require("../middleware/adminMiddleware");
 const ParteViajeros = require("../models/ParteViajeros");
 const Beds24Booking = require("../models/Beds24Booking");
+const Reserva = require("../models/Reserva");
 
 const esProduccion = (process.env.NODE_ENV === "production");
 const sesHospedajesRouter = express.Router();
@@ -210,6 +211,12 @@ function isValidNif(value) {
     if (!/^\d{8}[A-Z]$/.test(value)) return false;
     return NIF_LETTERS[Number(value.slice(0, 8)) % 23] === value[8];
 }
+// Número de soporte del documento:
+//   DNI español: 3 letras + 6 números (p. ej. AAA123456; en el DNI aparece como «IDESP» o «Nº SOPORTE»)
+//   NIE / TIE:   9 caracteres alfanuméricos (el Ministerio lo pide igual, el formato varía según la tarjeta)
+const SOPORTE_DNI = /^[A-Z]{3}\d{6}$/;
+const SOPORTE_NIE = /^[A-Z0-9]{9}$/;
+
 function isValidNie(value) {
     if (!/^[XYZ]\d{7}[A-Z]$/.test(value)) return false;
     const num = "XYZ".indexOf(value[0]) + value.slice(1, 8);
@@ -347,6 +354,12 @@ function validarParte(body, { paraEnviar }) {
         }
         if (persona.tipoDocumento === "NIE" && persona.numeroDocumento) {
             req(k("numeroDocumento"), isValidNie(persona.numeroDocumento), "NIE no válido (revisa la letra)");
+        }
+        if (persona.tipoDocumento === "NIF" && persona.soporteDocumento) {
+            req(k("soporteDocumento"), SOPORTE_DNI.test(persona.soporteDocumento), "Son 3 letras y 6 números (p. ej. AAA123456)");
+        }
+        if (persona.tipoDocumento === "NIE" && persona.soporteDocumento) {
+            req(k("soporteDocumento"), SOPORTE_NIE.test(persona.soporteDocumento), "Son 9 caracteres (letras y números)");
         }
 
         if (paraEnviar) {
@@ -840,11 +853,14 @@ sesHospedajesRouter.post("/api/admin/ses/probar", adminMiddleware, async (req, r
     }
 });
 
+// Canales que se listan en «Por comunicar» (no se listan las directas ni los usos propios)
+const ORIGENES_SES = new Set(["web", "airbnb", "booking"]);
+
 // Reservas que necesitan parte: llegadas de los últimos 30 días y los próximos 60
 sesHospedajesRouter.get("/api/admin/ses/reservas", adminMiddleware, async (req, res) => {
     try {
         const today = todayMadrid();
-        const bookings = await Beds24Booking.find({
+        const candidatas = await Beds24Booking.find({
             deletedInBeds24: false,
             status: { $in: ["confirmed", "new", "request"] },
             source: { $ne: "owner" },
@@ -853,6 +869,21 @@ sesHospedajesRouter.get("/api/admin/ses/reservas", adminMiddleware, async (req, 
             .sort({ arrival: 1 })
             .select("beds24Id status source arrival departure nights numAdult numChild firstName lastName email phone mobile country2 apiReference bookingTime price")
             .lean();
+
+        // Las reservas de la web pueden figurar como "direct" en Beds24 (referer API):
+        // se reconocen por el código QA-… o por estar en nuestras reservas web.
+        const directas = candidatas.filter((b) => b.source === "direct").map((b) => String(b.beds24Id));
+        const webIds = new Set(
+            directas.length
+                ? (await Reserva.find({ "beds24.bookingId": { $in: directas } }).select("beds24.bookingId").lean())
+                    .map((r) => String(r.beds24.bookingId))
+                : []
+        );
+        const bookings = candidatas
+            .map((b) => (b.source === "direct" && (webIds.has(String(b.beds24Id)) || String(b.apiReference || "").startsWith("QA-"))
+                ? { ...b, source: "web" }
+                : b))
+            .filter((b) => ORIGENES_SES.has(b.source));
 
         const partes = await ParteViajeros.find({ beds24Id: { $in: bookings.map((b) => b.beds24Id) } })
             .sort({ createdAt: 1 })
@@ -873,6 +904,73 @@ sesHospedajesRouter.get("/api/admin/ses/reservas", adminMiddleware, async (req, 
     } catch (error) {
         logError("SES: error listando reservas", error);
         res.status(500).json({ message: "No se han podido cargar las reservas" });
+    }
+});
+
+// ---------- Partes comunicados FUERA de esta web ----------
+// El servicio web del Ministerio solo permite consultar los lotes enviados por él mismo:
+// lo que se da de alta a mano en el portal de SES.Hospedajes no se puede leer desde aquí.
+// Por eso se deja constancia a mano: la reserva sale de «Por comunicar» y queda en el historial.
+const VIAS_EXTERNO = ["portal", "gestoria", "otro"];
+
+sesHospedajesRouter.post("/api/admin/ses/reservas/:beds24Id/externo", adminMiddleware, async (req, res) => {
+    try {
+        const beds24Id = Number(req.params.beds24Id);
+        if (!Number.isInteger(beds24Id) || beds24Id <= 0) return res.status(400).json({ message: "Reserva no válida" });
+
+        const errors = {};
+        const codigo = clean(req.body?.codigoComunicacion).toUpperCase().replace(/\s+/g, "");
+        const fecha = clean(req.body?.fecha);
+        const via = VIAS_EXTERNO.includes(req.body?.via) ? req.body.via : "portal";
+        const nota = clean(req.body?.nota);
+        if (codigo && (codigo.length > 60 || !/^[A-Z0-9-]+$/.test(codigo))) errors.codigoComunicacion = "Código no válido";
+        if (fecha && (!isValidDate(fecha) || fecha > todayMadrid())) errors.fecha = "Fecha no válida";
+        if (nota.length > 300) errors.nota = "Máximo 300 caracteres";
+        if (Object.keys(errors).length) return res.status(422).json({ message: "Revisa los campos marcados", errors });
+
+        const booking = await Beds24Booking.findOne({ beds24Id })
+            .select("beds24Id source arrival departure firstName lastName apiReference")
+            .lean();
+        if (!booking) return res.status(404).json({ message: "La reserva no existe" });
+
+        const externo = { fecha: fecha || null, via, nota, marcadoPor: quien(req), marcadoEn: new Date() };
+
+        // Si ya hay un parte activo: solo se puede marcar si nunca llegó al Ministerio desde aquí
+        const activo = await ParteViajeros.findOne({ beds24Id, estado: { $ne: "anulado" } });
+        if (activo) {
+            if (!["borrador", "error"].includes(activo.estado)) {
+                return res.status(409).json({ message: "Esta reserva ya tiene un parte enviado desde la web" });
+            }
+            activo.estado = "externo";
+            activo.externo = externo;
+            activo.codigoComunicacion = codigo || null;
+            activo.ultimoError = null;
+            activo.errores = [];
+            await activo.save();
+            return res.json({ parte: activo });
+        }
+
+        const esWeb = booking.source === "web" || String(booking.apiReference || "").startsWith("QA-")
+            || !!(await Reserva.exists({ "beds24.bookingId": String(beds24Id) }));
+        const parte = await ParteViajeros.create({
+            beds24Id,
+            origen: esWeb ? "web" : booking.source || null,
+            nombreReserva: [booking.firstName, booking.lastName].filter(Boolean).join(" ").trim().slice(0, 120) || null,
+            contrato: {
+                referencia: booking.apiReference || String(beds24Id),
+                fechaEntrada: booking.arrival ? `${booking.arrival}T00:00:00` : undefined,
+                fechaSalida: booking.departure ? `${booking.departure}T00:00:00` : undefined,
+            },
+            personas: [],
+            estado: "externo",
+            codigoComunicacion: codigo || null,
+            externo,
+            creadoPor: quien(req),
+        });
+        res.status(201).json({ parte });
+    } catch (error) {
+        logError("SES: error marcando parte externo", error);
+        res.status(500).json({ message: "No se ha podido guardar" });
     }
 });
 
@@ -954,8 +1052,8 @@ sesHospedajesRouter.put("/api/admin/ses/partes/:id", adminMiddleware, async (req
 // Borrar (solo si nunca llegó a aceptarse)
 sesHospedajesRouter.delete("/api/admin/ses/partes/:id", adminMiddleware, async (req, res) => {
     try {
-        const result = await ParteViajeros.deleteOne({ _id: req.params.id, estado: { $in: ["borrador", "error"] } });
-        if (!result.deletedCount) return res.status(409).json({ message: "Solo se pueden borrar borradores o partes rechazados" });
+        const result = await ParteViajeros.deleteOne({ _id: req.params.id, estado: { $in: ["borrador", "error", "externo"] } });
+        if (!result.deletedCount) return res.status(409).json({ message: "Solo se pueden borrar borradores, partes rechazados o marcas de «comunicado por fuera»" });
         res.json({ ok: true });
     } catch (error) {
         logError("SES: error borrando parte", error);
