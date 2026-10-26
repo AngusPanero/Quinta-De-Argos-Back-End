@@ -30,7 +30,7 @@ app.set('trust proxy', 1); // Para el Rate Limiter
 dbConnection()
 
 app.use(cors({
-    origin: [`${process.env.API_BACKEND_URL}`, `${process.env.BACKEND_RENDER_URL}`, `${process.env.FRONT_END}`, `${process.env.FRONT_END_WWW}`, `${process.env.LOCAL_HOST}`].filter(Boolean),
+    origin: [ /* "http://192.168.1.127:5173", */ `${process.env.API_BACKEND_URL}`, `${process.env.BACKEND_RENDER_URL}`, `${process.env.FRONT_END}`, `${process.env.FRONT_END_WWW}`, `${process.env.LOCAL_HOST}`].filter(Boolean),
     methods: [ "GET", "POST", "PUT", "PATCH", "DELETE" ],
     credentials: true,
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']

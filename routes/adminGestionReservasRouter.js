@@ -25,9 +25,13 @@ const { hoyEnEspana } = require("../services/reservasService");
 const { invalidarCacheDisponibilidad } = require("../services/beds24AvailabilityService");
 const {
     cancelarReservaBeds24, liberarSiSigueActiva, estadoReservaBeds24, ESTADOS_QUE_OCUPAN, invalidarCachesPanel,
+    modificarReservaBeds24, reservasQueSolapan,
 } = require("../services/beds24BookingsService");
 const { sincronizarReservaWeb, cancelarReservaWeb, CancelacionError } = require("../services/reservaWebBeds24Service");
-const { planificarReservaManual, crearReservaManual, GestionError, leerEuros, MAX_NOCHES_MANUAL } = require("../services/reservaManualService");
+const {
+    planificarReservaManual, crearReservaManual, validarReservaManual, datosParaBeds24,
+    GestionError, leerEuros, MAX_NOCHES_MANUAL,
+} = require("../services/reservaManualService");
 
 const adminGestionReservasRouter = express.Router();
 
@@ -193,6 +197,134 @@ adminGestionReservasRouter.post(
                 code: error.codigo || "BEDS24_ERROR",
             });
             enviarError(res, error, "Error creando la reserva manual");
+        }
+    })
+);
+
+// ---------- Editar reserva particular / uso propio ----------
+// Body igual que al crear: checkIn, checkOut, nombre, email, telefono, huespedes, precio, notas.
+// El tipo no se cambia. Si la estancia ya empezó, solo se puede cambiar la salida.
+async function planificarEdicion(beds24Id, body) {
+    const booking = await Beds24Booking.findOne({ beds24Id, deletedInBeds24: false }).lean();
+    if (!booking) throw new GestionError("NO_EXISTE", "La reserva no existe.", 404);
+    if (booking.source !== "direct" && booking.source !== "owner") {
+        throw new GestionError(
+            "NO_EDITABLE",
+            booking.source === "web"
+                ? "Las reservas web se cambian con «Cambiar fechas»."
+                : "Las reservas de Airbnb y Booking se cambian en cada plataforma.",
+            400
+        );
+    }
+    if (booking.status === "cancelled") throw new GestionError("YA_CANCELADA", "Esta reserva está cancelada.", 409);
+
+    const hoy = hoyEnEspana();
+    if (booking.departure <= hoy) throw new GestionError("TERMINADA", "Esta estancia ya ha terminado.", 400);
+    const empezada = booking.arrival <= hoy;
+
+    // Misma validación que al crear (lanza GestionError con los campos marcados)
+    const datos = validarReservaManual(
+        {
+            ...body,
+            tipo: booking.source === "owner" ? "uso_propio" : "particular",
+            checkIn: empezada ? booking.arrival : body?.checkIn,
+            quitarCierre: false,
+        },
+        empezada ? booking.arrival : hoy
+    );
+
+    // Solapes con otras reservas (la propia no cuenta)
+    const conflictos = (await reservasQueSolapan(datos.checkIn, datos.checkOut))
+        .filter((b) => Number(b.id) !== beds24Id)
+        .map((b) => ({
+            beds24Id: Number(b.id),
+            origen: b.referer || b.channel || "reserva",
+            nombre: [b.firstName, b.lastName].filter(Boolean).join(" ") || null,
+            checkIn: b.arrival,
+            checkOut: b.departure,
+        }));
+
+    const antes = {
+        checkIn: booking.arrival,
+        checkOut: booking.departure,
+        noches: booking.nights,
+        nombre: [booking.firstName, booking.lastName].filter(Boolean).join(" ") || null,
+        huespedes: booking.numAdult ?? null,
+        precio: typeof booking.price === "number" ? booking.price : null,
+    };
+    return { booking, antes, datos, conflictos, empezada };
+}
+
+function leerBeds24Id(req, res) {
+    const id = Number(req.params.beds24Id);
+    if (!Number.isInteger(id) || id <= 0) {
+        res.status(400).json({ message: "DATOS_INVALIDOS", detail: "Número de reserva no válido." });
+        return null;
+    }
+    return id;
+}
+
+adminGestionReservasRouter.post("/api/admin/gestion-reservas/:beds24Id/editar/preview", adminMiddleware, async (req, res) => {
+    const beds24Id = leerBeds24Id(req, res);
+    if (!beds24Id) return;
+    try {
+        const { antes, datos, conflictos, empezada } = await planificarEdicion(beds24Id, req.body);
+        res.json({ antes, datos, conflictos, empezada });
+    } catch (error) {
+        enviarError(res, error, "Error en la vista previa de la edición");
+    }
+});
+
+adminGestionReservasRouter.put(
+    "/api/admin/gestion-reservas/:beds24Id",
+    adminMiddleware,
+    requireFreshAdmin,
+    requireSignature(SECCION_FIRMA),
+    deUnoEnUno(async (req, res) => {
+        const beds24Id = leerBeds24Id(req, res);
+        if (!beds24Id) return;
+        try {
+            // Se vuelve a comprobar todo desde cero: no se fía de la vista previa
+            const { antes, datos, conflictos } = await planificarEdicion(beds24Id, req.body);
+            if (conflictos.length) {
+                throw new GestionError("FECHAS_OCUPADAS", "Esas fechas ya tienen otra reserva. Revisa el calendario.", 409, { conflictos });
+            }
+
+            // Misma reserva en Beds24: Booking y Airbnb se actualizan solos
+            await modificarReservaBeds24(beds24Id, datosParaBeds24(datos));
+
+            await Beds24Booking.updateOne(
+                { beds24Id },
+                {
+                    $set: {
+                        arrival: datos.checkIn,
+                        departure: datos.checkOut,
+                        nights: datos.noches,
+                        price: datos.precio,
+                        numAdult: datos.huespedes,
+                    },
+                }
+            ).catch(() => {});
+            invalidarCacheDisponibilidad();
+            invalidarCachesPanel();
+            require("../services/bookingSync").syncUpcoming?.().catch(() => {});
+
+            await audit(req, SECCION_FIRMA, "ok", {
+                accion: "editar_reserva",
+                tipo: datos.tipo,
+                beds24Id,
+                antes: { checkIn: antes.checkIn, checkOut: antes.checkOut, precio: antes.precio },
+                despues: { checkIn: datos.checkIn, checkOut: datos.checkOut, precio: datos.precio },
+            });
+
+            res.json({ editada: true, beds24Id, antes, datos });
+        } catch (error) {
+            await audit(req, SECCION_FIRMA, error instanceof GestionError ? "rejected" : "error", {
+                accion: "editar_reserva",
+                beds24Id,
+                code: error.codigo || "BEDS24_ERROR",
+            });
+            enviarError(res, error, "Error editando la reserva");
         }
     })
 );

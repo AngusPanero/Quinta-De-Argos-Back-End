@@ -199,6 +199,7 @@ module.exports = {
     validarReservaManual,
     planificarReservaManual,
     crearReservaManual,
+    datosParaBeds24,
     leerEuros,
     REFERER,
     MAX_NOCHES_MANUAL,
