@@ -173,16 +173,26 @@ function emailRestablecer(link) {
     };
 }
 
-// Nunca cortan el flujo: si falla, devuelven false y se loguea
+// Firebase limita cuántos links se generan por email en poco tiempo y lo
+// devuelve como auth/internal-error con TOO_MANY_ATTEMPTS_TRY_LATER adentro
+const esLimiteFirebase = (error) =>
+    error?.code === "auth/too-many-requests" ||
+    String(error?.message || "").includes("TOO_MANY_ATTEMPTS_TRY_LATER");
+
+// Nunca corta el flujo: devuelve { sent, rateLimited } y se loguea si falla
 async function sendVerificationEmail(email) {
     try {
         const link = await generarLink("verificacion", email);
         await sendMail({ to: email, ...emailVerificacion(link) });
-        return true;
+        return { sent: true, rateLimited: false };
     } catch (error) {
+        if (esLimiteFirebase(error)) {
+            console.warn(`⚠️ Verificación no reenviada a ${email}: límite de Firebase (ya se mandó hace poco)`);
+            return { sent: false, rateLimited: true };
+        }
         // El mensaje trae la respuesta cruda de Firebase / Brevo: es lo que dice el motivo real
         console.error(`Error sending verification email 🔴 ${error?.code || ""} — ${error?.message || error}`);
-        return false;
+        return { sent: false, rateLimited: false };
     }
 }
 
@@ -218,9 +228,13 @@ authRouter.post("/register", loginLimiter, async (req, res) => {
 
         // Mail de verificación por Brevo. No se setea cookie: el usuario recién
         // puede entrar cuando verifique. Si falla, se reenvía al intentar loguearse.
-        const verificationSent = await sendVerificationEmail(email);
+        const verification = await sendVerificationEmail(email);
 
-        return res.status(201).json({ message: `User created successfully! 🟢`, verificationSent })
+        return res.status(201).json({
+            message: `User created successfully! 🟢`,
+            verificationSent: verification.sent,
+            verificationRateLimited: verification.rateLimited,
+        })
     } catch (error) {
         if (error.code === 'auth/email-already-exists') {
             return res.status(409).json({
@@ -280,11 +294,12 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
         //    Como la contraseña es correcta, se le reenvía el mail de verificación
         //    (sirve de "reenviar verificación" sin exponer un endpoint aparte).
         if (decoded.admin !== true && decoded.email_verified !== true) {
-            const verificationSent = await sendVerificationEmail(email);
+            const verification = await sendVerificationEmail(email);
             return res.status(403).json({
                 code: "auth/email-not-verified",
                 message: "Email not verified",
-                verificationSent,
+                verificationSent: verification.sent,
+                verificationRateLimited: verification.rateLimited,
             });
         }
 
@@ -400,7 +415,7 @@ authRouter.post("/reset-password", loginLimiter, async (req, res) => {
         if (error?.code === "auth/user-not-found") {
             return res.status(200).json(genericOk);
         }
-        if (error?.code === "auth/too-many-requests") {
+        if (esLimiteFirebase(error)) {
             return res.status(429).json({ code: "auth/too-many-requests" });
         }
         console.error(esProduccion ? "Error sending password reset 🔴" : `Error sending password reset 🔴 ${error?.code || error}`);
