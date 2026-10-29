@@ -87,9 +87,11 @@ async function generarLink(tipo, email) {
     try {
         return await generar({ url: `${EMPRESA.web}/` });
     } catch (err) {
-        // Firebase a veces devuelve un dominio no autorizado como internal-error:
-        // ante cualquier fallo se reintenta sin redirección y se deja constancia
-        console.warn(`⚠️ generarLink(${tipo}) con redirección falló: ${err?.code} — ${err?.message}`);
+        // Solo se reintenta si el problema es el dominio. Si es el límite de
+        // Firebase, reintentar sería otro intento más que alarga el bloqueo.
+        const esDominio = err?.code === "auth/unauthorized-continue-uri" || err?.code === "auth/invalid-continue-uri";
+        if (!esDominio) throw err;
+        console.warn(`⚠️ generarLink(${tipo}): ${EMPRESA.web} no está en "Dominios autorizados" de Firebase. Se envía sin redirección.`);
         return await generar(undefined);
     }
 }
