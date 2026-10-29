@@ -42,6 +42,39 @@ const paymentsRouter = express.Router();
 
 const esperar = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// ---------- Límite por IP ----------
+// /intent crea una reserva en la base, un PaymentIntent en Stripe y consulta a
+// Beds24 en fresco. Sin límite, un script puede llenar la base de reservas
+// pendientes, gastar el cupo de Beds24 y, sobre todo, usar los pagos para
+// "probar tarjetas robadas" (card testing): Stripe puede restringir la cuenta.
+const VENTANA_MS = 15 * 60 * 1000;
+const LIMITES = { intent: 8, status: 60 }; // por IP y por ventana de 15 min
+const pedidosPorIp = new Map();
+
+function limitePorIp(tipo) {
+    return (req, res, next) => {
+        const ip = req.headers["cf-connecting-ip"] || req.ip || "desconocida";
+        const clave = `${tipo}:${ip}`;
+        const ahora = Date.now();
+        const registro = pedidosPorIp.get(clave);
+
+        if (!registro || ahora - registro.inicio > VENTANA_MS) {
+            pedidosPorIp.set(clave, { inicio: ahora, cantidad: 1 });
+        } else if (++registro.cantidad > LIMITES[tipo]) {
+            res.set("Retry-After", String(Math.ceil((VENTANA_MS - (ahora - registro.inicio)) / 1000)));
+            return res.status(429).json({
+                codigo: "DEMASIADOS_INTENTOS",
+                mensaje: "Has hecho demasiados intentos seguidos. Espera unos minutos y vuelve a intentarlo.",
+            });
+        }
+
+        if (pedidosPorIp.size > 5000) {
+            for (const [k, r] of pedidosPorIp) if (ahora - r.inicio > VENTANA_MS) pedidosPorIp.delete(k);
+        }
+        next();
+    };
+}
+
 // ---------- Helpers ----------
 
 async function crearReservaPendiente(datos) {
@@ -77,6 +110,18 @@ async function confirmBooking(paymentIntent) {
     }
     // Ya cancelada o reembolsada desde el panel: no se vuelve a crear.
     if (reserva.estado === "cancelada" || reserva.estado === "reembolsada") return;
+
+    // Control extra: lo cobrado tiene que ser exactamente lo que calculó el
+    // servidor para esta reserva. El importe lo fija el backend al crear el
+    // PaymentIntent, así que esto no debería fallar nunca; si falla, no se
+    // confirma la reserva y queda en el log para revisarla a mano.
+    const cobrado = paymentIntent.amount_received ?? paymentIntent.amount;
+    const esperado = reserva.pago?.importeCentimos;
+    const monedaOk = String(paymentIntent.currency || "").toLowerCase() === String(MONEDA).toLowerCase();
+    if (!monedaOk || (Number.isFinite(esperado) && cobrado !== esperado)) {
+        console.error(`🚨 Importe del pago no coincide con la reserva ${reserva.codigo}: cobrado ${cobrado} ${paymentIntent.currency}, esperado ${esperado} ${MONEDA} (${paymentIntent.id}). No se confirma: revisar en Stripe.`);
+        return;
+    }
 
     if (reserva.estado !== "pagada") {
         reserva.pago.paymentIntentId = paymentIntent.id;
@@ -205,7 +250,7 @@ async function handleChargeRefunded(charge) {
 }
 
 // ---------- 1) Guardar reserva y crear PaymentIntent ----------
-paymentsRouter.post("/intent", express.json({ limit: "20kb" }), async (req, res) => {
+paymentsRouter.post("/intent", limitePorIp("intent"), express.json({ limit: "20kb" }), async (req, res) => {
     let reserva = null;
     try {
         // a) Datos del cliente y consentimientos (antes de llamar a nadie).
@@ -294,7 +339,7 @@ paymentsRouter.post("/intent", express.json({ limit: "20kb" }), async (req, res)
 });
 
 // ---------- 2) Estado del pago ----------
-paymentsRouter.get("/status/:id", async (req, res) => {
+paymentsRouter.get("/status/:id", limitePorIp("status"), async (req, res) => {
     const { id } = req.params;
     if (!/^pi_[A-Za-z0-9]+$/.test(id)) return res.status(400).json({ mensaje: "Identificador no válido" });
     try {

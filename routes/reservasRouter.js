@@ -17,6 +17,37 @@ const {
 
 const reservasRouter = express.Router();
 
+// ─── Límite por IP ────────────────────────────────────────────────────────────
+// Cada pedido consulta a Beds24, que tiene un cupo de uso de su API. Sin límite,
+// un script podría pedir el calendario sin parar, agotar ese cupo y dejar la web
+// (y la sincronización con Booking/Airbnb) sin disponibilidad.
+// Una persona usando el calendario no se acerca a 40 pedidos por minuto.
+const VENTANA_MS = 60 * 1000;
+const MAX_POR_VENTANA = 40;
+const pedidosPorIp = new Map();
+
+function limitePublico(req, res, next) {
+    const ip = req.headers["cf-connecting-ip"] || req.ip || "desconocida";
+    const ahora = Date.now();
+    const registro = pedidosPorIp.get(ip);
+
+    if (!registro || ahora - registro.inicio > VENTANA_MS) {
+        pedidosPorIp.set(ip, { inicio: ahora, cantidad: 1 });
+    } else if (++registro.cantidad > MAX_POR_VENTANA) {
+        res.set("Retry-After", String(Math.ceil((VENTANA_MS - (ahora - registro.inicio)) / 1000)));
+        return res.status(429).json({
+            codigo: "DEMASIADOS_PEDIDOS",
+            mensaje: "Has hecho demasiadas consultas seguidas. Espera un minuto y vuelve a intentarlo.",
+        });
+    }
+
+    // Limpieza ocasional para que el mapa no crezca sin fin
+    if (pedidosPorIp.size > 5000) {
+        for (const [clave, r] of pedidosPorIp) if (ahora - r.inicio > VENTANA_MS) pedidosPorIp.delete(clave);
+    }
+    next();
+}
+
 function enviarError(res, error, etiqueta) {
     if (error instanceof ReservaError) {
         return res.status(error.status).json({ codigo: error.codigo, mensaje: error.message, ...error.extra });
@@ -32,7 +63,7 @@ function enviarError(res, error, etiqueta) {
     });
 }
 
-reservasRouter.get("/api/reservas/disponibilidad", async (req, res) => {
+reservasRouter.get("/api/reservas/disponibilidad", limitePublico, async (req, res) => {
     try {
         const { hoy, ultimaNoche } = limitesReserva();
         const ocupadas = await getNochesOcupadas(hoy, ultimaNoche);
@@ -53,7 +84,7 @@ reservasRouter.get("/api/reservas/disponibilidad", async (req, res) => {
     }
 });
 
-reservasRouter.post("/api/reservas/presupuesto", async (req, res) => {
+reservasRouter.post("/api/reservas/presupuesto", limitePublico, async (req, res) => {
     try {
         const { hoy, ultimaNoche } = limitesReserva();
         const ocupadas = await getNochesOcupadas(hoy, ultimaNoche);

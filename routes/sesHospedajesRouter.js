@@ -68,9 +68,19 @@ function sesConfig() {
 // ---------- Certificados ----------
 // El servidor del Ministerio no envía su certificado intermedio (error UNABLE_TO_VERIFY_LEAF_SIGNATURE).
 // Se descarga una sola vez de la dirección que indica su propio certificado (AIA "CA Issuers"),
-// como hacen los navegadores, y se añade a los de confianza. La cadena se sigue verificando
-// contra las autoridades raíz de Node: no se desactiva ninguna comprobación.
+// como hacen los navegadores. Lo que se pasa en `ca` pasa a ser de CONFIANZA, así que antes de
+// añadirlo se comprueba que sea un certificado de CA, vigente y FIRMADO por una autoridad raíz
+// de Node: si alguien interceptara la descarga (va por http), su certificado se rechaza.
 // Opcional: SES_CA_PEM con el intermedio en PEM, por si la descarga automática fallara.
+const ROOT_CAS = tls.rootCertificates.map((pem) => new crypto.X509Certificate(pem));
+
+function intermedioDeConfianza(pem) {
+    const cert = new crypto.X509Certificate(pem);
+    const ahora = Date.now();
+    if (!cert.ca) return false;
+    if (new Date(cert.validFrom).getTime() > ahora || new Date(cert.validTo).getTime() < ahora) return false;
+    return ROOT_CAS.some((root) => cert.checkIssued(root) && cert.verify(root.publicKey));
+}
 const TLS_CHAIN_ERRORS = new Set([
     "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
     "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
@@ -146,6 +156,9 @@ function learnIntermediate(url) {
                 const pem = text.includes("-----BEGIN CERTIFICATE-----")
                     ? text
                     : new crypto.X509Certificate(buf).toString();
+                if (!intermedioDeConfianza(pem)) {
+                    throw new Error("el certificado descargado no está firmado por una autoridad raíz de confianza");
+                }
                 extraCAs.add(pem);
                 httpsAgent = null;
                 console.log(`SES: certificado intermedio del Ministerio añadido (${new crypto.X509Certificate(pem).subject.split("\n").find((l) => l.startsWith("CN=")) || uri}) 🟢`);
