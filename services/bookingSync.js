@@ -110,13 +110,17 @@ async function getCalendar(from, to) {
 async function handleWebhookBooking(incoming) {
     if (!incoming?.id || Number(incoming.roomId) !== ROOM_ID) return { skipped: true };
 
-    // El webhook no trae datos personales: se pide la reserva completa
+    // Del aviso solo se usa el id: la reserva siempre se lee de la API de Beds24.
+    // Así, aunque alguien consiguiera el secreto del webhook, no podría guardar
+    // datos inventados: solo lo que Beds24 confirme.
     let full;
     try {
         full = await fetchBookingById(incoming.id);
     } catch (err) {
-        console.warn(`Webhook Beds24: no se pudo leer la reserva ${incoming.id}, se usa el aviso 🟠`);
-        full = undefined;
+        // Sin confirmación de Beds24 no se guarda nada. La próxima
+        // sincronización (cron o botón del panel) la trae igual.
+        console.warn(`Webhook Beds24: no se pudo leer la reserva ${incoming.id}, queda para la próxima sincronización 🟠`);
+        return { skipped: true, retryLater: true };
     }
 
     if (full === null) {
@@ -129,7 +133,7 @@ async function handleWebhookBooking(incoming) {
         return { deleted: true };
     }
 
-    const result = await upsertBooking(full || incoming);
+    const result = await upsertBooking(full);
     invalidateCalendarCache();
     return result;
 }
