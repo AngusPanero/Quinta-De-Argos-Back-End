@@ -450,6 +450,14 @@ adminGestionReservasRouter.post(
         try {
             const reserva = await Reserva.findById(req.params.id);
             if (!reserva) return res.status(404).json({ message: "NO_EXISTE", detail: "La reserva no existe." });
+            // Solo los pagos confirmados por Stripe pasan a Beds24: una reserva sin pagar,
+            // fallida o cancelada no puede ocupar fechas en Booking y Airbnb.
+            if (reserva.estado !== "pagada") {
+                return res.status(409).json({
+                    message: "NO_PAGADA",
+                    detail: "Solo se pueden pasar a Beds24 las reservas web pagadas.",
+                });
+            }
             const resultado = await sincronizarReservaWeb(reserva);
             if (resultado.estado === "creada" || resultado.estado === "ya_existia") {
                 require("../services/bookingSync").syncUpcoming?.().catch(() => {});

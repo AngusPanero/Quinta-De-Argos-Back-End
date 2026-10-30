@@ -1,5 +1,5 @@
-// Vuelve a consultar Firebase en el momento: si al admin le sacaron el claim
-// o deshabilitaron la cuenta, no puede firmar aunque su cookie siga vigente.
+// Vuelve a consultar Firebase en el momento: si al admin le sacaron el claim,
+// lo banearon o deshabilitaron la cuenta, no puede firmar aunque su cookie siga vigente.
 // Va DESPUÉS de adminMiddleware (que deja el token verificado en req.user).
 const auth = require("../config/firebase");
 
@@ -11,7 +11,8 @@ const requireFreshAdmin = async (req, res, next) => {
 
     try {
         const user = await auth.getUser(uid);
-        if (user.disabled || user.customClaims?.admin !== true) {
+        const claims = user.customClaims || {};
+        if (user.disabled || claims.banned === true || claims.admin !== true) {
             return res.status(403).json({ message: "ACCESS_DENIED: ADMIN_ONLY_ZONE 🔴" });
         }
         req.freshAdmin = { uid: user.uid, email: user.email || null };
